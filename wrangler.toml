@@ -3,9 +3,6 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-[build]
-command = "npm run build"
-
 # KV namespace for OAuth sessions (nonces, codes, session tokens)
 # Create with: wrangler kv namespace create SESSIONS
 # Then paste the returned id below.
