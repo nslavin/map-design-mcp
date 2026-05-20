@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## What this is
 
-A Cloudflare Worker (Hono framework) that serves as an MCP gateway for Mapbox map design tools. It is co-developed inside the `figma-map-studio` monorepo under `map-design-worker/` and periodically exported here via `git subtree push`.
+A standalone Cloudflare Worker (Hono framework) that serves as an MCP gateway for Mapbox map design tools.
 
 ## Build & Run
 

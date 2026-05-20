@@ -419,6 +419,7 @@ function adjustForContrast(color: string, bg: string, target = 4.5): string {
     const candidate = hslToHex(h, s, l);
     if (wcagRatio(candidate, bg) >= target) return candidate;
   }
+  // No valid contrast found in 40 iterations — fall back to near-black/near-white
   const bgL = relativeLuminance(bg);
   return bgL > 0.5 ? "#1a1a1a" : "#f5f5f5";
 }
@@ -469,7 +470,6 @@ export function handlePaletteSuggest(input: PaletteSuggestInput): {
     lightPreset: isDark ? "night" : "day",
     colorLand: landColor,
     colorWater: waterOverride ?? waterColor,
-    ...(waterOverride ? { colorWater: waterOverride } : {}),
   };
 
   const pairBg = isDark ? "#0e1a26" : "#f5f3ef";
@@ -502,6 +502,7 @@ const PRESETS: Record<string, StandardConfig> = {
   logistics_customer: { lightPreset: "day", theme: "faded", showPointOfInterestLabels: false, showLandmarkIcons: false, show3dBuildings: false, colorWater: "#b8d4e8" },
   logistics_driver:   { lightPreset: "day", theme: "default", showPointOfInterestLabels: false, show3dBuildings: true, showLandmarkIcons: false },
   logistics_ops:      { lightPreset: "day", theme: "monochrome", showPointOfInterestLabels: false, showLandmarkIcons: false, show3dBuildings: false },
+  travel:             { lightPreset: "day", theme: "default", showPointOfInterestLabels: true, showLandmarkIcons: true, show3dBuildings: true },
   travel_discovery:   { lightPreset: "day", theme: "default", showPointOfInterestLabels: true, showLandmarkIcons: true, show3dBuildings: true },
   travel_navigation:  { lightPreset: "day", theme: "default", showPointOfInterestLabels: true, showLandmarkIcons: true, show3dBuildings: false },
   real_estate:        { lightPreset: "day", theme: "faded", showPointOfInterestLabels: false, show3dBuildings: false, showPlaceLabels: true },
@@ -529,7 +530,7 @@ const PRESET_INSTRUCTIONS: Record<string, string[]> = {
     "Paths and cycleways need visual prominence over car roads — requires Classic mode or a custom line layer",
     "Add a custom line layer for cycling routes: yellow highlight at z13+, car roads in grey",
     "Filter commercial POIs: show only campsites, trailheads, water sources (minzoom:12)",
-    "GPS trace layer: line-width expression ['interpolate',['linear'],['zoom'],10,2,16,5]",
+    "GPS trace layer: line-width expression ['interpolate',['linear'],['zoom'],10,1,16,4]",
   ],
   journalism: [
     "Use publication house-style font family for labels if available",
@@ -578,6 +579,7 @@ const RATIONALE: Record<string, string> = {
   logistics_customer: "Faded theme with brand color only on courier dot — customer view needs ambient comfort, not driver utility.",
   logistics_driver:   "Default theme with buildings on — building footprints are the strongest last-50-feet delivery cue.",
   logistics_ops:      "Monochrome base with clustering mandatory — ops dashboard must handle thousands of fleet dots without mush.",
+  travel:             "Default travel config — full discovery mode. Use travel_discovery or travel_navigation for more specific sub-modes.",
   travel_discovery:   "All landmarks and POIs on — discovery is the product; pedestrian density and 3D anchors are signals not noise.",
   travel_navigation:  "Landmarks on, POIs reduced — wayfinding mode needs icons as anchors but not full discovery density.",
   real_estate:        "Faded base, POIs off, 3D off — listings must be the only thing that pops. Parcels cannot be occluded.",
@@ -597,6 +599,7 @@ const SEGMENT_PREVIEW_CENTERS: Record<string, { lng: number; lat: number; zoom: 
   logistics_customer:  { lng: -73.99, lat: 40.73, zoom: 13 },
   logistics_driver:    { lng: -73.99, lat: 40.73, zoom: 17 },
   logistics_ops:       { lng: -87.63, lat: 41.88, zoom: 10 },
+  travel:              { lng:   2.35, lat: 48.86, zoom: 14 },
   travel_discovery:    { lng:   2.35, lat: 48.86, zoom: 14 },
   travel_navigation:   { lng:   2.35, lat: 48.86, zoom: 15 },
   real_estate:         { lng: -118.49, lat: 34.02, zoom: 14 },

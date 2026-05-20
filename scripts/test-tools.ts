@@ -5,6 +5,7 @@
  */
 
 import { handleDesignAudit, handlePaletteSuggest, handleSegmentPreset, handleWcagValidate } from "../src/tools.js";
+import { SEGMENT_KEYS } from "../src/design-guidance.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,13 +153,8 @@ test("unknown segment → graceful error message", () => {
   expect(r.rationale).toContain("Unknown segment");
 });
 
-test("all 16 segments return a non-empty config", () => {
-  const segments = [
-    "logistics_customer","logistics_driver","logistics_ops",
-    "travel_discovery","travel_navigation","real_estate","automotive",
-    "data_viz","outdoors","social","journalism","retail",
-    "weather","telecom","mobility","public_sector",
-  ];
+test("all segments return a non-empty config", () => {
+  const segments = SEGMENT_KEYS;
   for (const seg of segments) {
     const r = handleSegmentPreset({ segment: seg });
     if (!Object.keys(r.config).length) throw new Error(`empty config for segment: ${seg}`);

@@ -1,6 +1,6 @@
 # map-design-mcp
 
-Cloudflare Worker that serves as an MCP gateway for Mapbox map design tools. Used by the [Figma Map Studio](https://github.com/nslavin/figma-map-studio) plugin and by Figma Make / Claude Code as a single-URL MCP connector.
+Cloudflare Worker that serves as an MCP gateway for Mapbox map design tools. Connect any MCP client (Claude Code, Cursor, etc.) to a single URL and get native cartographic design tools plus proxied access to Mapbox APIs.
 
 **Deployed at:** `https://map-design-mcp.workers.dev`
 

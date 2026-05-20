@@ -1,7 +1,7 @@
 /**
- * Map Studio MCP Gateway — Cloudflare Worker
+ * Map Design MCP Gateway — Cloudflare Worker
  *
- * Aggregator endpoint for Figma Make / Claude Code. Serves native design tools,
+ * Aggregator endpoint for MCP clients (Claude Code, Cursor, etc.). Serves native design tools,
  * proxies Mapbox MCP + DevKit MCP, and provides Mapbox Styles/Tokens API tools.
  *
  * MCP endpoint: https://map-design-mcp.workers.dev/mcp
@@ -601,7 +601,7 @@ const MCP_TOOLS = [
       },
       {
         name: "list_tokens_tool",
-        description: "List existing Mapbox public access tokens for the authenticated account. Use this BEFORE create_token_tool to check if a suitable token (e.g. note='figma-make') already exists — avoids token proliferation.",
+        description: "List existing Mapbox public access tokens for the authenticated account. Use this BEFORE create_token_tool to check if a suitable token already exists — avoids token proliferation.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -869,12 +869,14 @@ async function executeTool(
       if (input.limit) qs.set("limit", String(input.limit));
       if (input.start) qs.set("start", String(input.start));
       const res = await fetch(`https://api.mapbox.com/styles/v1/${u}?${qs}`);
+      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "retrieve_style_tool": {
       const { styleId } = input as { styleId: string };
       const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
       const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`);
+      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "create_style_tool": {
@@ -885,6 +887,7 @@ async function executeTool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ...style, name }),
       });
+      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "update_style_tool": {
@@ -898,6 +901,7 @@ async function executeTool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "delete_style_tool": {
@@ -913,6 +917,7 @@ async function executeTool(
       const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
       const qs = new URLSearchParams({ access_token: mapboxToken });
       const res = await fetch(`https://api.mapbox.com/tokens/v2/${u}?${qs}`);
+      if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "create_token_tool": {
@@ -929,6 +934,7 @@ async function executeTool(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
     case "directions": {
@@ -941,6 +947,7 @@ async function executeTool(
           const geoRes = await fetch(
             `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(wp)}.json?access_token=${mapboxToken}&limit=1`
           );
+          if (!geoRes.ok) throw new Error(`Geocoding error ${geoRes.status} for waypoint "${wp}"`);
           const geoJson = await geoRes.json() as { features?: Array<{ center: [number, number] }> };
           const feature = geoJson.features?.[0];
           if (!feature) throw new Error(`Could not geocode waypoint: "${wp}"`);
@@ -950,6 +957,7 @@ async function executeTool(
       const res = await fetch(
         `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coords.join(";")}?access_token=${mapboxToken}&geometries=geojson&steps=true&overview=full`
       );
+      if (!res.ok) throw new Error(`Mapbox Directions API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
   }
@@ -970,7 +978,7 @@ app.post("/mcp", async (c) => {
   const base = `https://${c.req.header("host")}`;
   const mapboxToken = await getMapboxToken(c.req.header("Authorization"), c.env);
 
-  // ── Standard MCP JSON-RPC protocol (Figma Make / Claude Code) ────────────
+  // ── Standard MCP JSON-RPC protocol ────────────────────────────────────────
   if (body.jsonrpc === "2.0") {
     const { id, method, params } = body as { id: unknown; method: string; params?: Record<string, unknown> };
 

@@ -1,16 +1,12 @@
 export const DEV_PATTERNS: Record<string, string> = {
 
 scaffolding: `
-MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable April 2026)
+MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable)
 
 ━━ STEP 0 — TOKEN (do this before writing a single line of map code) ━━━━━━━━
-  1. Call list_tokens_tool() — find a token where note === 'figma-make'
-  2a. Found + has all required scopes → use its token value as mapboxgl.accessToken
-  2b. Not found OR scopes missing → call create_token_tool({
-        note: 'figma-make',
-        scopes: ['styles:tiles','styles:read','fonts:read','datasets:read']
-      }) and use the returned pk.* value
-  NEVER use a placeholder token. The Figma Make built-in token is EXPIRED.
+  See TOKEN SECURITY section for full instructions.
+  Short version: call list_tokens_tool() first — create a token only if none exists.
+  NEVER use a placeholder token.
 
 ━━ COMPLETE WORKING TEMPLATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 <!DOCTYPE html>
@@ -48,7 +44,7 @@ MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable April 2026)
 </html>
 
 ━━ WHY MAPS DON'T RENDER — top 5 root causes ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  1. EXPIRED TOKEN  → list_tokens_tool() first; create fresh figma-make token if needed
+  1. MISSING TOKEN  → list_tokens_tool() first; create a fresh token if none with required scopes exists
   2. ZERO-HEIGHT CONTAINER  → #map needs explicit height (100vh, 600px, etc); flex/grid parents too
   3. CSS NOT LOADED  → <link mapbox-gl.css> MUST be before <script mapbox-gl.js>
   4. ADDING LAYERS BEFORE 'load'  → ALL addSource/addLayer must be inside map.on('load', ...)
@@ -593,7 +589,7 @@ TOKEN SECURITY:
 
 Public token (pk.*) — safe in frontend:
   mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN
-  Restrict to your domain + *.figma.com; scopes: styles:read fonts:read tiles:read
+  Restrict to your domain (e.g. *.yourdomain.com); scopes: styles:read fonts:read tiles:read
 
 Secret token (sk.*) — NEVER in frontend:
   Only for server-side Styles API write / MTS upload
@@ -601,14 +597,14 @@ Secret token (sk.*) — NEVER in frontend:
 
 Never commit tokens: .env.local + .gitignore
 
-In Figma Make — ALWAYS do this before generating any map code:
+Before generating any map code — ALWAYS get a valid token:
   Required scopes: ['styles:tiles','styles:read','fonts:read','datasets:read']
-  1. Call list_tokens_tool() — find a token where note === 'figma-make'
+  1. Call list_tokens_tool() — find a token where note === 'my-app'
   2. If found: verify it has ALL required scopes
        If scopes match → use its token value as mapboxgl.accessToken
        If scopes are missing → create a new one (step 3); leave the old token as-is
-  3. If not found (or scopes insufficient): call create_token_tool({note:'figma-make',scopes:[required]}) and use the returned pk.* value
-  4. NEVER rely on an environment default — the figmamake built-in token is expired
+  3. If not found (or scopes insufficient): call create_token_tool({note:'my-app',scopes:[required]}) and use the returned pk.* value
+  4. NEVER use a placeholder or hardcoded token value
   5. Never commit token values to prompts, files, or code
 `,
 
