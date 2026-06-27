@@ -6,6 +6,7 @@
 
 import { handleDesignAudit, handlePaletteSuggest, handleSegmentPreset, handleWcagValidate } from "../src/tools.js";
 import { SEGMENT_KEYS } from "../src/design-guidance.js";
+import { DEV_PATTERNS } from "../src/dev-patterns.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -205,6 +206,115 @@ test("style_json mode scans symbol layers", () => {
   });
   expect(r.pairs.length).toBe(1);
   expect(r.pairs[0]?.layer_id as string).toBe("place-label");
+});
+
+// ── handleDesignAudit — symbol layer validators ───────────────────────────────
+
+console.log("\n── handleDesignAudit (symbol validators) ────────────────────────");
+
+test("no custom symbol/circle layers → no-symbol-layers warning", () => {
+  const result = handleDesignAudit({
+    style_json: {
+      layers: [
+        { id: "background", type: "background", paint: { "background-color": "#fff" } },
+        { id: "road", type: "line", source: "composite", paint: { "line-color": "#ccc" } },
+      ],
+      sources: {},
+    },
+  });
+  const ids = result.violations.map((v) => v.id);
+  if (!ids.includes("no-symbol-layers")) throw new Error(`expected no-symbol-layers, got: ${ids.join(", ")}`);
+});
+
+test("flat icon-size number → flat-icon-size violation with fix hint", () => {
+  const result = handleDesignAudit({
+    style_json: {
+      layers: [
+        {
+          id: "poi",
+          type: "symbol",
+          source: "my-source",
+          layout: { "icon-image": "marker", "icon-size": 1 },
+        },
+      ],
+      sources: { "my-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } } },
+    },
+  });
+  const ids = result.violations.map((v) => v.id);
+  if (!ids.includes("flat-icon-size")) throw new Error(`expected flat-icon-size, got: ${ids.join(", ")}`);
+  const v = result.violations.find((x) => x.id === "flat-icon-size")!;
+  expect(v.fix).toContain("interpolate");
+});
+
+test("text-anchor:center with icon-image → label-on-icon error", () => {
+  const result = handleDesignAudit({
+    style_json: {
+      layers: [
+        {
+          id: "places",
+          type: "symbol",
+          source: "my-source",
+          layout: { "icon-image": "marker", "text-field": "{name}", "text-anchor": "center" },
+        },
+      ],
+      sources: { "my-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } } },
+    },
+  });
+  const ids = result.violations.map((v) => v.id);
+  if (!ids.includes("label-on-icon")) throw new Error(`expected label-on-icon, got: ${ids.join(", ")}`);
+  const v = result.violations.find((x) => x.id === "label-on-icon")!;
+  expect(v.severity).toBe("error");
+});
+
+test("icon+label without text-variable-anchor → missing-variable-anchor info", () => {
+  const result = handleDesignAudit({
+    style_json: {
+      layers: [
+        {
+          id: "shops",
+          type: "symbol",
+          source: "my-source",
+          layout: { "icon-image": "shop", "text-field": "{name}", "text-anchor": "top" },
+        },
+      ],
+      sources: { "my-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } } },
+    },
+  });
+  const ids = result.violations.map((v) => v.id);
+  if (!ids.includes("missing-variable-anchor")) throw new Error(`expected missing-variable-anchor, got: ${ids.join(", ")}`);
+});
+
+test("symbol layer with no icon-image and no text-field → empty-symbol-layer warning", () => {
+  const result = handleDesignAudit({
+    style_json: {
+      layers: [
+        {
+          id: "ghost-layer",
+          type: "symbol",
+          source: "my-source",
+          layout: {},
+        },
+      ],
+      sources: { "my-source": { type: "geojson", data: { type: "FeatureCollection", features: [] } } },
+    },
+  });
+  const ids = result.violations.map((v) => v.id);
+  if (!ids.includes("empty-symbol-layer")) throw new Error(`expected empty-symbol-layer, got: ${ids.join(", ")}`);
+});
+
+// ── DEV_PATTERNS smoke tests ──────────────────────────────────────────────────
+
+console.log("\n── DEV_PATTERNS ─────────────────────────────────────────────────");
+
+test("pins_and_markers pattern returns content with MARKER section", () => {
+  const content = DEV_PATTERNS["pins_and_markers"];
+  if (!content || content.trim().length === 0) throw new Error("expected non-empty pins_and_markers pattern");
+  expect(content).toContain("MARKER");
+});
+
+test("unknown pattern key is not present in DEV_PATTERNS", () => {
+  const content = DEV_PATTERNS["nonexistent_pattern_xyz"];
+  if (content !== undefined) throw new Error("expected undefined for unknown pattern key");
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────
