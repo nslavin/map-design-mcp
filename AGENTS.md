@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code when working in this repository.
+This file provides guidance to Codex when working in this repository.
 
 ## What this is
 
@@ -24,13 +24,12 @@ npm test           # unit tests for native tool handlers
 | `src/tools.ts` | Native tool implementations: `handleDesignAudit`, `handlePaletteSuggest`, `handleSegmentPreset`, `handleWcagValidate` |
 | `src/design-guidance.ts` | Cartographic knowledge base — 13 segment blocks + 8 topic blocks, `getGuidance()` |
 | `src/dev-patterns.ts` | 16 Mapbox GL JS v3 code pattern modules, `handleGetDevPatterns()` |
-| `src/maki-icons.ts` | 19 Maki icons as inline SVGs (CC0) — used in `svgToImageData` demo code |
 | `scripts/test-tools.ts` | Unit tests for all native handlers — run with `npm test` |
 | `wrangler.toml` | Cloudflare config: KV binding (`SESSIONS`), compatibility flags |
 
 ## Tool routing
 
-- **No-auth tools**: `get_dev_patterns`, `get_design_guidance`, `design_audit`, `palette_suggest`, `segment_preset`, `wcag_validate`, `category_search`
+- **No-auth tools**: `get_dev_patterns`, `get_design_guidance`, `design_audit`, `palette_suggest`, `segment_preset`, `wcag_validate`
 - **Auth-required tools**: Styles API + Tokens API (direct), Mapbox MCP proxy, DevKit MCP proxy
 
 ## MCP protocol
