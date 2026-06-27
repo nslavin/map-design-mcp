@@ -186,6 +186,82 @@ export function handleDesignAudit(input: AuditInput): {
     });
   }
 
+  // ── HTML marker anti-pattern hint ──────────────────────────────────────────
+
+  const customSymbolLayers = layers.filter(
+    (l) => l.type === "symbol" && l.source && !String(l.source).startsWith("mapbox") && l.source !== "composite"
+  );
+  const customCircleLayers = layers.filter(
+    (l) => l.type === "circle" && l.source && !String(l.source).startsWith("mapbox") && l.source !== "composite"
+  );
+  if (customSymbolLayers.length === 0 && customCircleLayers.length === 0 && layers.length > 0) {
+    violations.push({
+      id: "no-symbol-layers",
+      severity: "warn",
+      message: "No custom symbol or circle layers found. For large datasets (50+ points) use GL symbol layers — they provide collision detection, clustering, and feature-state. mapboxgl.Marker is valid only for small sets (<50) with per-element DOM interaction.",
+      fix: "See get_dev_patterns('pins_and_markers') for the symbol layer + feature-state pattern.",
+    });
+  }
+
+  // ── Symbol layer anti-patterns ─────────────────────────────────────────────
+
+  const symbolLayers = layers.filter((l) => l.type === "symbol");
+
+  const flatIconSize = symbolLayers.filter(
+    (l) => typeof l.layout?.["icon-size"] === "number"
+  );
+  for (const l of flatIconSize) {
+    violations.push({
+      id: "flat-icon-size",
+      severity: "warn",
+      message: `Symbol layer '${l.id}' uses a flat icon-size value — icons will look wrong across zoom levels.`,
+      fix: "Replace with a zoom-interpolate expression: ['interpolate',['linear'],['zoom'], 10, 0.6, 15, 1.2]",
+    });
+  }
+
+  const centerAnchorWithIcon = symbolLayers.filter(
+    (l) =>
+      l.layout?.["icon-image"] &&
+      l.layout?.["text-anchor"] === "center" &&
+      !l.layout?.["text-variable-anchor"]
+  );
+  for (const l of centerAnchorWithIcon) {
+    violations.push({
+      id: "label-on-icon",
+      severity: "error",
+      message: `Symbol layer '${l.id}' uses text-anchor:'center' with icon-image — the label will overlap the icon.`,
+      fix: "Use text-variable-anchor:['top','top-right','top-left','right','left'] + text-radial-offset:1.5",
+    });
+  }
+
+  const missingVariableAnchor = symbolLayers.filter(
+    (l) =>
+      l.layout?.["icon-image"] &&
+      l.layout?.["text-field"] &&
+      !l.layout?.["text-variable-anchor"] &&
+      l.layout?.["text-anchor"] !== "center"
+  );
+  for (const l of missingVariableAnchor) {
+    violations.push({
+      id: "missing-variable-anchor",
+      severity: "info",
+      message: `Symbol layer '${l.id}' has icon + label but no text-variable-anchor — labels may collide at scale.`,
+      fix: "Add text-variable-anchor:['top','top-right','top-left','right','left'] and text-radial-offset:1.5",
+    });
+  }
+
+  const emptySymbolLayers = symbolLayers.filter(
+    (l) => !l.layout?.["icon-image"] && !l.layout?.["text-field"]
+  );
+  for (const l of emptySymbolLayers) {
+    violations.push({
+      id: "empty-symbol-layer",
+      severity: "warn",
+      message: `Symbol layer '${l.id}' has no icon-image and no text-field — it renders nothing.`,
+      fix: "Add icon-image (load an image with map.addImage first) or text-field to display content.",
+    });
+  }
+
   // ── Color / Contrast ───────────────────────────────────────────────────────
 
   if (input.standard_config && !input.style_json) {
@@ -633,7 +709,10 @@ export function handleSegmentPreset(input: SegmentPresetInput): {
   const config = { ...preset };
   if (input.time_of_day) config.lightPreset = input.time_of_day;
 
-  const instructions = PRESET_INSTRUCTIONS[input.segment] ?? [];
+  const instructions = [
+    ...(PRESET_INSTRUCTIONS[input.segment] ?? []),
+    "For point markers or icons: call get_dev_patterns('pins_and_markers') — choose Marker (SVG/PNG file, <50 points), symbol layer (SVG or PNG, 50+ points), or dots (circle layer, no icon).",
+  ];
   const rationale = RATIONALE[input.segment] ?? "";
 
   const result: { config: StandardConfig; instructions: string[]; rationale: string; preview_url?: string } = {

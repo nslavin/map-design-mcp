@@ -31,7 +31,7 @@ const MAPBOX_MCP_TOOLS = new Set([
   "isochrone",
   "matrix",
   "static_map",
-  "category_search",
+  // category_search is implemented directly below (direct Search Box API call)
 ]);
 
 const DEVKIT_MCP_TOOLS = new Set([
@@ -960,7 +960,45 @@ async function executeTool(
       if (!res.ok) throw new Error(`Mapbox Directions API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
+
+    case "category_search": {
+    const { category, proximity, limit = 5 } = input as { category: string; proximity?: string; limit?: number };
+    const params = new URLSearchParams({
+      access_token: mapboxToken,
+      limit: String(Math.min(limit, 10)),
+      language: "en",
+    });
+    if (proximity) {
+      const isCoord = /^-?\d+\.?\d*,-?\d+\.?\d*$/.test(proximity.trim());
+      if (isCoord) {
+        params.set("proximity", proximity.trim());
+      } else {
+        const geoRes = await fetch(
+          `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(proximity)}.json?access_token=${mapboxToken}&limit=1`
+        );
+        if (geoRes.ok) {
+          const geoJson = await geoRes.json() as { features?: Array<{ center: [number, number] }> };
+          const center = geoJson.features?.[0]?.center;
+          if (center) params.set("proximity", `${center[0]},${center[1]}`);
+        }
+      }
+    }
+    const res = await fetch(
+      `https://api.mapbox.com/search/searchbox/v1/category/${encodeURIComponent(category)}?${params}`
+    );
+    if (!res.ok) throw new Error(`Mapbox Search API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+    const json = await res.json() as { features?: Array<{ properties: Record<string, unknown>; geometry: { coordinates: [number, number] } }> };
+    return {
+      results: (json.features ?? []).map((f) => ({
+        name: f.properties.name,
+        category: f.properties.poi_category,
+        coordinates: f.geometry.coordinates,
+        address: f.properties.full_address ?? f.properties.address,
+        mapbox_id: f.properties.mapbox_id,
+      })),
+    };
   }
+  } // end switch
 
   // Mapbox MCP / DevKit MCP proxy
   if (MAPBOX_MCP_TOOLS.has(toolName) || DEVKIT_MCP_TOOLS.has(toolName)) {
