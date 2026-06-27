@@ -619,28 +619,31 @@ export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
 
   icons: {
     principles: [
-      "Mapbox Standard ships only 2 built-in icons: 'marker' and 'intersection' — use 'marker' for generic pins",
-      "Custom SVG icons are rasterized via canvas at 2× pixel ratio before being added as GL images",
-      "24×24 viewBox renders as 48px canvas texture → scales back to 24px — power-of-2 is crisp",
-      "Flat fill paths render cleanest; gradients, strokes, and filters degrade after rasterization",
-      "icon-size must be a zoom-interpolate expression — a flat number looks wrong at different zooms",
+      "THREE options — Marker (mapboxgl.Marker + CSS backgroundImage): small sets <50, per-element interaction, use SVG/PNG file directly; Symbol layer (icon-image): 50+ points, collision detection, clustering, feature state; Dots (circle layer + text): dense data, no icon needed",
+      "All custom layers go in slot:'top' — lower slots bury markers under roads and basemap labels",
+      "SVG for symbol layers must have flat fills only — gradients/filters break canvas rasterization; for Figma Make SVGs strip <defs>/<linearGradient>/<filter>/<clipPath> and replace gradient refs with flat hex",
+      "icon-size must be a zoom-interpolate expression — a flat number looks wrong across zoom levels",
     ],
     do_list: [
-      "Use icon-image:'marker' for any generic location pin — no SVG or loadImage needed",
-      "Custom SVG: viewBox='0 0 24 24', single flat fill color, max 3–4 <path> elements",
-      "icon-anchor:'bottom' for push-pin shapes (tip points at coordinate)",
-      "icon-anchor:'center' for circles, dots, and square markers",
-      "icon-size expression: ['interpolate',['linear'],['zoom'], 10, 0.6, 14, 1.0, 18, 1.4]",
-      "Pair any icon+label layer with text-variable-anchor + text-radial-offset (see get_dev_patterns pins_and_markers)",
+      "Marker option: el.style.backgroundImage = 'url(/icons/pin.svg)' — SVG or PNG file, no rasterization needed",
+      "Symbol layer option A (generic): icon-image:'marker' built-in, no loading needed, paint: { icon-color: '#hex' }",
+      "Symbol layer option B (PNG): map.loadImage() → map.addImage() → symbol layer",
+      "Symbol layer option C (SVG): svgToImageData(svgString, 48) → map.addImage('pin', img, { pixelRatio:2 }) → symbol layer",
+      "Dots option: circle layer + symbol layer (text only) on same source, both slot:'top'",
+      "Set text-optional:true — labels drop before icons in collision",
+      "Always add a fallback to every 'match' expression — omitting it is a GL runtime error",
     ],
     dont_list: [
-      "Don't use SVG gradient fills — they become muddy blobs after rasterization",
-      "Don't use stroke on SVG paths — aliasing halos appear at small sizes",
-      "Don't use filter effects (feDropShadow, feGaussianBlur) in SVGs",
-      "Don't use a flat icon-size value — icons look huge at high zoom or tiny at low zoom",
+      "Don't use SVG gradient fills in symbol layer icons — they become muddy blobs after rasterization",
+      "Don't use a flat icon-size value — use zoom-interpolate expression",
       "Don't use text-anchor:'center' when icon-image is also set — label lands on the icon",
+      "Don't use sdf:true when SVG has multiple colors baked in — SDF strips fills to a single tintable channel",
+      "Don't apply CSS transform (or will-change:transform) to any ancestor of the map container — it creates a stacking context that makes marker positioning relative to that element instead of the viewport, causing markers to drift on zoom and pan.",
     ],
-    config_hints: {},
+    config_hints: {
+      "figma_make_svg_pipeline": "Figma Make is an AI code generator — SVGs are AI-authored paths. For Marker: use SVG file directly as backgroundImage, zero cleanup needed. For symbol layer: strip <defs>/<linearGradient>/<filter>/<clipPath>, replace fill='url(#...)' with flat hex, remove class= and style= attributes, ensure square viewBox.",
+      "see_dev_patterns": "get_dev_patterns('pins_and_markers') for complete code — Marker, symbol layer (built-in/PNG/SVG), and dots patterns",
+    },
   },
 
   standard_config: {

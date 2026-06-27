@@ -69,87 +69,171 @@ MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable)
   map.addLayer({ id: 'x', type: 'fill', source: 's', slot: 'top', paint: {...} })
 
 ━━ REACT ESSENTIALS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  import 'mapbox-gl/dist/mapbox-gl.css'             // REQUIRED — controls invisible without this
+  import 'mapbox-gl/dist/mapbox-gl.css'  // REQUIRED — omitting this makes controls invisible
+
+  // Complete working React component — copy this, do not reconstruct from parts:
+  import { useEffect, useRef } from 'react'
+  import mapboxgl from 'mapbox-gl'
+  import 'mapbox-gl/dist/mapbox-gl.css'
+
   mapboxgl.accessToken = import.meta.env.VITE_MAPBOX_TOKEN
-  // Container MUST have explicit height — zero-height div = invisible map
-  // Always return () => map.current?.remove() from the useEffect for cleanup
+
+  export function MapView() {
+    const containerRef = useRef(null)
+    const mapRef = useRef(null)
+
+    useEffect(() => {
+      if (mapRef.current) return  // StrictMode guard — prevents double init
+      mapRef.current = new mapboxgl.Map({
+        container: containerRef.current,
+        style: 'mapbox://styles/mapbox/standard',
+        center: [0, 20],
+        zoom: 2,
+      })
+      mapRef.current.on('load', () => {
+        // addSource / addLayer calls go here
+      })
+
+      // map.resize() is required when the container reaches its final size AFTER map init.
+      // Symptoms without it: map renders at partial size on first load, correct after reload.
+      // Cause: React paint, CSS transitions on parent, or flex/grid layout still settling.
+      const ro = new ResizeObserver(() => mapRef.current?.resize())
+      ro.observe(containerRef.current)
+
+      return () => { ro.disconnect(); mapRef.current?.remove(); mapRef.current = null }
+    }, [])
+
+    // height MUST be an explicit value — never 'height: 100%' unless every ancestor also has height set.
+    // Use '100vh', '600px', or a fixed calc() — not a percentage on its own.
+    // ⚠️  NO CSS transform on this div or any ancestor — transform creates a stacking context
+    // and Mapbox marker positioning breaks: markers drift away on zoom/pan.
+    return <div ref={containerRef} style={{ width: '100%', height: '100vh' }} />
+  }
+
+━━ NEXT PATTERNS TO CALL ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Map has points / markers / icons?  → call get_dev_patterns('pins_and_markers')
+  Map has routes / directions?       → call get_dev_patterns('routing_and_directions')
+  Map has data layers / polygons?    → call get_dev_patterns('data_layers')
+  Always call design_audit() after generating any style.
 `,
 
 pins_and_markers: `
-PINS AND MARKERS:
+MARKER / SYMBOL LAYER / DOTS — pick one:
 Examples: /example/add-a-marker/ /example/custom-marker-icons/ /example/geojson-markers/
 
-ICON ANCHOR CHEATSHEET:
-  Push-pin / teardrop shape:  icon-anchor 'bottom'  (pin tip = coordinate)
-  Circle / dot marker:        icon-anchor 'center'
-  Rectangular badge:          icon-anchor 'center' + icon-text-fit 'both' + icon-text-fit-padding [4,8,4,8]
+━━ MARKER (mapboxgl.Marker) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use for: small count (<50), per-element click/interaction, any SVG or PNG icon.
+SVG/PNG used directly as CSS background-image — no rasterization step needed.
 
-LABEL PLACEMENT — use the modern variable-anchor approach:
-  MODERN (preferred): text-variable-anchor + text-radial-offset
-    → renderer tries each anchor in order and picks the first non-colliding position
-    → eliminates the "label on top of icon" bug at scale
-  STATIC (simple single-icon maps only): text-anchor 'top' + text-offset [0, 1.25]
-  NEVER: text-anchor 'center' with icon-image — label lands directly on the icon
-
-< 100 → mapboxgl.Marker (HTML, full DOM control):
-  new mapboxgl.Marker().setLngLat([12.55, 55.7]).addTo(map)
-  new mapboxgl.Marker({ color:'#e63946', rotation:45 }).setLngLat([lng,lat]).addTo(map)
-  // Custom element:
-  const el = document.createElement('div')
-  el.className = 'my-marker'  // style with CSS background-image
-  new mapboxgl.Marker({ element:el }).setLngLat([lng,lat]).addTo(map)
-  // NOTE: map.loadImage() accepts PNG/JPG/WebP only — NOT SVG directly
-
-// BUILT-IN: For simple location pins, no loadImage needed:
-//   'icon-image': 'marker'   ← Mapbox Standard ships this icon natively
-//   Only 2 built-in icons exist in Standard: 'marker' and 'intersection'
-
-100–1,000 → Symbol layer with MODERN label placement:
-  map.loadImage('https://...icon.png', (err, image) => {
-    if (err) throw err
-    map.addImage('custom-icon', image)
-    map.addSource('places', { type:'geojson', data:featureCollection })
-    map.addLayer({
-      id:'places', type:'symbol', source:'places', slot:'top',
-      layout:{
-        'icon-image': 'custom-icon',
-        'icon-anchor': 'bottom',                    // push-pin tip at coordinate
-        'icon-size': ['interpolate',['linear'],['zoom'], 10, 0.6, 15, 1.2],
-        'text-field': ['get', 'name'],
-        'text-size': 12,
-        // Modern variable-anchor: renderer picks least-colliding position from list
-        'text-variable-anchor': ['top','top-right','top-left','right','left'],
-        'text-radial-offset': 1.5,                  // em units from icon edge
-        'text-justify': 'auto',                     // pairs with variable-anchor
-        'text-allow-overlap': false,
-      },
-      paint:{
-        'text-color': '#111111',
-        'text-halo-color': 'rgba(255,255,255,0.92)',
-        'text-halo-width': 1.5,
-      }
-    })
+  geojson.features.forEach(feature => {
+    const el = document.createElement('div')
+    el.style.backgroundImage = 'url(/icons/pin.svg)'  // SVG file, PNG, or data URI
+    el.style.width = '40px'
+    el.style.height = '40px'
+    el.style.backgroundSize = 'cover'
+    el.addEventListener('click', () => { /* per-marker interaction */ })
+    new mapboxgl.Marker(el).setLngLat(feature.geometry.coordinates).addTo(map)
   })
 
-1,000+ → Clustered source (see clustering pattern)
+  // Draggable single drop-pin:
+  const marker = new mapboxgl.Marker({ draggable: true }).setLngLat([lng, lat]).addTo(map)
+  marker.on('dragend', () => console.log(marker.getLngLat()))
 
-CUSTOM SVG ICONS — quality rules:
-  SVGs must be rasterized via canvas (map.loadImage does not accept SVG).
-  Rasterization is done at 2× pixel ratio → 24px viewBox = 48px canvas = crisp 24px icon.
-  viewBox: "0 0 24 24" — keep it 24×24 or 32×32 (power-of-2)
-  Flat fill ONLY — no gradients, no feDropShadow/feGaussianBlur, no stroke on paths
-  Max 3–4 <path> elements — GPU texture artifacts appear with complex paths
-  Anti-patterns: gradient fills, stroke-based shapes, filter effects, icon-size as a flat number
+━━ SYMBOL LAYER ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use for: 50+ points, collision detection, clustering, feature state.
+Three icon sources — pick one:
 
-Selected state:
-  map.setFeatureState({ source:'places', id:featureId }, { selected:true })
-  // paint: ['case',['boolean',['feature-state','selected'],false], selectedColor, defaultColor]
+  A. Built-in 'marker' (no loading needed, generic pin only):
+    map.addLayer({ id: 'pins', type: 'symbol', source: 'src', slot: 'top',
+      layout: { 'icon-image': 'marker', 'icon-anchor': 'bottom',
+        'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.6, 14, 1.0] },
+      paint: { 'icon-color': '#0050AA' }
+    })
 
-Draggable: new mapboxgl.Marker({ draggable:true }).on('dragend', () => marker.getLngLat())
-Toggle:    marker.getElement().style.display = 'none'
-Cursor:    map.on('mouseenter','places',()=>map.getCanvas().style.cursor='pointer')
-           map.on('mouseleave','places',()=>map.getCanvas().style.cursor='')
-`,
+  B. PNG or image file:
+    map.loadImage('/icons/pin.png', (err, img) => {
+      if (err) throw err
+      map.addImage('pin', img)
+      map.addSource('places', { type: 'geojson', data: fc })
+      map.addLayer({ id: 'pins', type: 'symbol', source: 'places', slot: 'top',
+        layout: { 'icon-image': 'pin', 'icon-anchor': 'bottom',
+          'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 15, 0.8] }
+      })
+    })
+
+  C. SVG string rasterized to ImageData:
+    // SVG rules: flat fill colors only, no <defs>/<linearGradient>/<filter>/<clipPath>,
+    // square viewBox. Figma Make SVGs need gradient refs replaced with flat hex fills.
+    function svgToImageData(svgString, size = 48) {
+      return new Promise((resolve, reject) => {
+        const img = new Image()
+        img.onload = () => {
+          const canvas = document.createElement('canvas')
+          canvas.width = canvas.height = size
+          const ctx = canvas.getContext('2d')
+          ctx.drawImage(img, 0, 0, size, size)
+          resolve(ctx.getImageData(0, 0, size, size))  // must be ImageData, not canvas
+        }
+        img.onerror = reject
+        img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svgString)
+      })
+    }
+
+    const iconSvg = \`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+      <path fill="#0050AA" d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z"/>
+    </svg>\`
+
+    map.on('load', async () => {
+      const img = await svgToImageData(iconSvg, 48)
+      map.addImage('pin', img, { pixelRatio: 2 })  // do NOT use sdf:true with multi-color SVG
+      map.addSource('places', { type: 'geojson', data: fc })
+      map.addLayer({ id: 'pins', type: 'symbol', source: 'places', slot: 'top',
+        layout: {
+          'icon-image': 'pin',
+          'icon-anchor': 'bottom',
+          'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.6, 14, 1.0, 18, 1.4],
+          'text-field': ['get', 'name'],
+          'text-optional': true,
+          'text-variable-anchor': ['top', 'right', 'left'],
+          'text-radial-offset': 1.2,
+        },
+        paint: { 'text-color': '#202020', 'text-halo-color': '#fff', 'text-halo-width': 2 }
+      })
+    })
+
+━━ DOTS (circle layer + label, no icon) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Use for: dense data, category color coding, no custom icon needed.
+Two layers on the same source — circle first, then symbol (text only) on top.
+
+  map.addSource('places', { type: 'geojson', data: fc })
+  map.addLayer({ id: 'dots', type: 'circle', source: 'places', slot: 'top',
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 4, 15, 8],
+      'circle-color': ['match', ['get', 'category'],
+        'medical', '#e63946', 'food', '#f4a261', '#1a78c2'  // fallback required
+      ],
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': '#fff',
+    }
+  })
+  map.addLayer({ id: 'labels', type: 'symbol', source: 'places', slot: 'top',
+    layout: {
+      'text-field': ['get', 'name'],
+      'text-size': 11,
+      'text-optional': true,
+      'text-variable-anchor': ['top', 'right', 'left'],
+      'text-radial-offset': 0.8,
+    },
+    paint: { 'text-color': '#202020', 'text-halo-color': '#fff', 'text-halo-width': 2 }
+  })
+
+KEY RULES (all three patterns):
+  slot:'top' on every custom layer — lower slots bury markers under roads
+  icon-anchor:'bottom' for push-pin shapes, 'center' for circles/dots
+  icon-size must be a zoom-interpolate expression — never a flat number
+  text-optional:true — labels drop before icons in collision
+  'match' expressions must end with a fallback value — omitting it is a GL runtime error
+  1,000+ points → use clustering source instead (see clustering pattern)`,
 
 popups: `
 POPUPS:
