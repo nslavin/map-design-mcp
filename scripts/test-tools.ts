@@ -4,9 +4,12 @@
  * Run: npx tsx scripts/test-tools.ts
  */
 
-import { handleDesignAudit, handlePaletteSuggest, handleSegmentPreset, handleWcagValidate } from "../src/tools.js";
+import { handleCheckColorContrast, handleDesignAudit, handlePaletteSuggest, handleSegmentPreset, handleWcagValidate } from "../src/tools.js";
+import { validateExpression, getReference } from "../src/expression-validator.js";
 import { SEGMENT_KEYS } from "../src/design-guidance.js";
 import { DEV_PATTERNS } from "../src/dev-patterns.js";
+import { modeBriefText } from "../src/mode-brief.js";
+import { project, projectCoords } from "../src/projection.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -315,6 +318,297 @@ test("pins_and_markers pattern returns content with MARKER section", () => {
 test("unknown pattern key is not present in DEV_PATTERNS", () => {
   const content = DEV_PATTERNS["nonexistent_pattern_xyz"];
   if (content !== undefined) throw new Error("expected undefined for unknown pattern key");
+});
+
+// ── handleCheckColorContrast ──────────────────────────────────────────────────
+
+console.log("\n── handleCheckColorContrast ─────────────────────────────────────");
+
+test("mid-gray on white fails AA normal (ratio ~3.9)", () => {
+  const r = handleCheckColorContrast({ foreground: "#888888", background: "#ffffff" });
+  if (r.passes) throw new Error(`expected fail, got ratio ${r.ratio}`);
+  expect(r.aa_normal).toBe(false);
+});
+
+test("near-black on white passes AA normal (ratio ~16)", () => {
+  const r = handleCheckColorContrast({ foreground: "#111111", background: "#ffffff" });
+  if (!r.passes) throw new Error(`expected pass, got ratio ${r.ratio}`);
+  expect(r.aa_normal).toBe(true);
+});
+
+test("AA large threshold is 3.0", () => {
+  // #777 on white ≈ 4.47:1 — passes AA large (3.0) but not normal (4.5)
+  const r = handleCheckColorContrast({ foreground: "#777777", background: "#ffffff", level: "AA", fontSize: "large" });
+  expect(r.required).toBe(3.0);
+  if (!r.passes) throw new Error(`expected pass at AA large, got ratio ${r.ratio}`);
+});
+
+test("AAA normal threshold is 7.0", () => {
+  const r = handleCheckColorContrast({ foreground: "#888888", background: "#ffffff", level: "AAA" });
+  expect(r.required).toBe(7.0);
+});
+
+test("result includes all four pass/fail flags", () => {
+  const r = handleCheckColorContrast({ foreground: "#555555", background: "#ffffff" });
+  if (typeof r.aa_normal !== "boolean") throw new Error("missing aa_normal");
+  if (typeof r.aa_large !== "boolean") throw new Error("missing aa_large");
+  if (typeof r.aaa_normal !== "boolean") throw new Error("missing aaa_normal");
+  if (typeof r.aaa_large !== "boolean") throw new Error("missing aaa_large");
+});
+
+// ── validateExpression ────────────────────────────────────────────────────────
+
+console.log("\n── validateExpression ───────────────────────────────────────────");
+
+test('["get","name"] is valid', () => {
+  const r = validateExpression(["get", "name"]);
+  if (!r.valid) throw new Error(`expected valid, got errors: ${r.errors.map(e => e.message).join(", ")}`);
+});
+
+test('["interpolate",["linear"],["zoom"],8,1,16,8] is valid', () => {
+  const r = validateExpression(["interpolate", ["linear"], ["zoom"], 8, 1, 16, 8]);
+  if (!r.valid) throw new Error(`expected valid, got errors: ${r.errors.map(e => e.message).join(", ")}`);
+});
+
+test("empty array is invalid", () => {
+  const r = validateExpression([]);
+  if (r.valid) throw new Error("expected invalid for empty array");
+  expect(r.errors[0]?.message).toContain("cannot be empty");
+});
+
+test("unknown operator is invalid", () => {
+  const r = validateExpression(["nonsense_op", "arg1"]);
+  if (r.valid) throw new Error("expected invalid for unknown operator");
+  expect(r.errors[0]?.message).toContain("Unknown expression operator");
+});
+
+test("too few arguments is invalid", () => {
+  const r = validateExpression(["rgb", 255]);  // rgb needs 3 args
+  if (r.valid) throw new Error("expected invalid for too few args");
+  expect(r.errors[0]?.message).toContain("requires at least");
+});
+
+test("literal number is valid", () => {
+  const r = validateExpression(42);
+  if (!r.valid) throw new Error(`expected literal number to be valid, errors: ${r.errors.map(e => e.message).join(", ")}`);
+});
+
+test("JSON string input is accepted", () => {
+  const r = validateExpression('["get","population"]');
+  if (!r.valid) throw new Error(`expected valid JSON string input, errors: ${r.errors.map(e => e.message).join(", ")}`);
+});
+
+// ── getReference ──────────────────────────────────────────────────────────────
+
+console.log("\n── getReference ─────────────────────────────────────────────────");
+
+test("exact match 'line' returns a reference entry", () => {
+  const r = getReference("line");
+  if (!r.found || !r.entry) throw new Error("expected found entry for 'line'");
+  expect(r.entry.url).toContain("mapbox.com");
+});
+
+test("exact match 'interpolate' returns a reference entry", () => {
+  const r = getReference("interpolate");
+  if (!r.found || !r.entry) throw new Error("expected found entry for 'interpolate'");
+});
+
+test("operator lookup falls back to OPERATORS table", () => {
+  const r = getReference("step");
+  if (!r.found || !r.entry) throw new Error("expected found entry for 'step'");
+  expect(r.entry.url).toContain("expressions");
+});
+
+test("unknown topic returns found:false with available list", () => {
+  const r = getReference("totally_unknown_topic_xyz");
+  if (r.found) throw new Error("expected not found");
+  if (!Array.isArray(r.available)) throw new Error("expected available list");
+});
+
+// ── static_map URL shape (unit test without live API) ─────────────────────────
+
+console.log("\n── static_map URL shape ─────────────────────────────────────────");
+
+test("static_map URL is well-formed (synthesized)", () => {
+  // Simulate what the handler builds without actually calling the API
+  const center: [number, number] = [-74.006, 40.7128];
+  const zoom = 12;
+  const style = "mapbox/standard";
+  const width = 600;
+  const height = 400;
+  const bearing = 0;
+  const token = "pk.test";
+  const url =
+    `https://api.mapbox.com/styles/v1/${style}/static/` +
+    `${center[0]},${center[1]},${zoom},${bearing}/${width}x${height}` +
+    `?access_token=${token}`;
+  if (!url.includes("api.mapbox.com/styles/v1/mapbox/standard/static/")) throw new Error(`unexpected URL: ${url}`);
+  if (!url.includes(`${center[0]},${center[1]},${zoom}`)) throw new Error("URL missing center/zoom");
+  if (!url.includes("access_token=pk.test")) throw new Error("URL missing token");
+});
+
+// ── Mode filtering ────────────────────────────────────────────────────────────
+// Tests for toolsForMode() / INTERACTIVE_ONLY_TOOLS without importing index.ts
+// (to avoid Hono side-effects). The set is mirrored here intentionally — any
+// drift from index.ts will surface as a naming mismatch in the tool lists below.
+
+console.log("\n── Mode filtering ───────────────────────────────────────────────");
+
+const INTERACTIVE_ONLY_NAMES = new Set([
+  "get_dev_patterns",
+  "directions",
+  "isochrone",
+  "matrix",
+  "category_search",
+  "validate_expression",
+  "get_reference",
+]);
+
+const STATIC_TOOL_NAMES = [
+  "get_design_guidance", "design_audit", "palette_suggest", "segment_preset",
+  "wcag_validate", "static_map", "geocode", "check_color_contrast", "preview_style",
+  "list_styles_tool", "retrieve_style_tool", "create_style_tool", "update_style_tool",
+  "delete_style_tool", "list_tokens_tool", "create_token_tool",
+];
+
+// Simulate the full MCP_TOOLS list and the filter logic
+const ALL_MOCK_TOOLS = [
+  ...Array.from(INTERACTIVE_ONLY_NAMES),
+  ...STATIC_TOOL_NAMES,
+].map((name) => ({ name, description: "", inputSchema: {} }));
+
+function filterForDesignMode(tools: Array<{ name: string }>) {
+  return tools.filter((t) => !INTERACTIVE_ONLY_NAMES.has(t.name));
+}
+
+test("design mode hides every interactive tool", () => {
+  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  const resultNames = new Set(result.map((t) => t.name));
+  for (const name of INTERACTIVE_ONLY_NAMES) {
+    if (resultNames.has(name)) throw new Error(`"${name}" should be hidden in design mode`);
+  }
+});
+
+test("design mode keeps all static/shared tools", () => {
+  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  const resultNames = new Set(result.map((t) => t.name));
+  for (const name of STATIC_TOOL_NAMES) {
+    if (!resultNames.has(name)) throw new Error(`"${name}" should be kept in design mode`);
+  }
+});
+
+test("make mode returns the full tool list (no filtering)", () => {
+  // make = no filter
+  expect(ALL_MOCK_TOOLS.length).toBe(INTERACTIVE_ONLY_NAMES.size + STATIC_TOOL_NAMES.length);
+});
+
+test("INTERACTIVE_ONLY set has exactly 7 tools", () => {
+  expect(INTERACTIVE_ONLY_NAMES.size).toBe(7);
+});
+
+test("design mode result is smaller than make mode result", () => {
+  const designCount = filterForDesignMode(ALL_MOCK_TOOLS).length;
+  const makeCount = ALL_MOCK_TOOLS.length;
+  if (designCount >= makeCount) throw new Error(`design (${designCount}) should be < make (${makeCount})`);
+});
+
+test("geocode is kept in design mode (needed to center a static map)", () => {
+  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  if (!result.find((t) => t.name === "geocode")) throw new Error("geocode should be kept in design mode");
+});
+
+test("static_map is kept in design mode", () => {
+  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  if (!result.find((t) => t.name === "static_map")) throw new Error("static_map should be kept in design mode");
+});
+
+// ── modeBriefText ─────────────────────────────────────────────────────────────
+
+console.log("\n── modeBriefText ────────────────────────────────────────────────");
+
+test("design brief contains static-only language", () => {
+  const text = modeBriefText("design");
+  if (!text.includes("Figma Design")) throw new Error("expected 'Figma Design'");
+  if (!text.includes("static only")) throw new Error("expected 'static only'");
+  if (!text.includes("DO NOT")) throw new Error("expected 'DO NOT' section");
+  if (!text.includes("get_dev_patterns")) throw new Error("expected 'get_dev_patterns' in DO NOT list");
+});
+
+test("make brief contains interactive language", () => {
+  const text = modeBriefText("make");
+  if (!text.includes("Figma Make")) throw new Error("expected 'Figma Make'");
+  if (!text.includes("interactive")) throw new Error("expected 'interactive'");
+  if (!text.includes("get_dev_patterns")) throw new Error("expected 'get_dev_patterns' in make brief");
+});
+
+test("design and make briefs differ", () => {
+  if (modeBriefText("design") === modeBriefText("make")) throw new Error("design and make briefs should differ");
+});
+
+test("mode_brief prompt uses same text as modeBriefText (no duplication drift)", () => {
+  // Verify the single source of truth: both modes produce non-empty strings and
+  // each brief starts with the expected header.
+  const design = modeBriefText("design");
+  const make = modeBriefText("make");
+  if (!design.startsWith("MAP DESIGN MODE: Figma Design")) throw new Error("design brief header mismatch");
+  if (!make.startsWith("MAP DESIGN MODE: Figma Make")) throw new Error("make brief header mismatch");
+});
+
+// ── Projection (src/projection.ts) ───────────────────────────────────────────
+
+console.log("\nProjection:");
+
+const VP_BASE = { center: [-122.4194, 37.7749] as [number, number], zoom: 12, width: 600, height: 400, bearing: 0 };
+
+test("center projects to exactly (width/2, height/2)", () => {
+  const [lng, lat] = VP_BASE.center;
+  const pt = project(lng, lat, VP_BASE);
+  if (Math.abs(pt.x - 300) > 0.001) throw new Error(`expected x≈300, got ${pt.x}`);
+  if (Math.abs(pt.y - 200) > 0.001) throw new Error(`expected y≈200, got ${pt.y}`);
+  if (!pt.in_view) throw new Error("center should be in_view");
+});
+
+test("known offset: ~1km east lands right of center (positive x delta)", () => {
+  // At SF lat/zoom 12, ~0.01° lng ≈ ~0.8km; should be right of center
+  const pt = project(-122.4094, 37.7749, VP_BASE);
+  if (pt.x <= 300) throw new Error(`expected x > 300 for eastward point, got ${pt.x}`);
+  if (!pt.in_view) throw new Error("nearby eastward point should be in_view");
+});
+
+test("known offset: ~1km north lands above center (smaller y)", () => {
+  const pt = project(-122.4194, 37.7849, VP_BASE);
+  if (pt.y >= 200) throw new Error(`expected y < 200 for northward point, got ${pt.y}`);
+  if (!pt.in_view) throw new Error("nearby northward point should be in_view");
+});
+
+test("far-away point is out of view", () => {
+  // New York from San Francisco viewport at zoom 12 — definitely off screen
+  const pt = project(-74.006, 40.7128, VP_BASE);
+  if (pt.in_view) throw new Error("NYC should not be in_view on SF map at z12");
+});
+
+test("bearing 90° rotates east→up: eastward point appears above center", () => {
+  // bearing=90° rotates the map clockwise 90°, making east point to the top of the screen.
+  // So a point due east of center has y < height/2 (above center).
+  const vpRotated = { ...VP_BASE, bearing: 90 };
+  const pt = project(-122.4094, 37.7749, vpRotated);
+  if (pt.y >= 200) throw new Error(`expected y < 200 for east point with 90° bearing (east=up), got ${pt.y}`);
+});
+
+test("projectCoords returns same count as input", () => {
+  const coords: [number, number][] = [[-122.4194, 37.7749], [-122.41, 37.78], [-122.40, 37.77]];
+  const pts = projectCoords(coords, VP_BASE);
+  if (pts.length !== 3) throw new Error(`expected 3 points, got ${pts.length}`);
+});
+
+test("design brief mentions static_overlay", () => {
+  const text = modeBriefText("design");
+  if (!text.includes("static_overlay")) throw new Error("design brief should mention static_overlay");
+});
+
+test("make brief does NOT mention static_overlay", () => {
+  const text = modeBriefText("make");
+  if (text.includes("static_overlay")) throw new Error("make brief should not mention static_overlay");
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

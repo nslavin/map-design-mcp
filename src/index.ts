@@ -9,80 +9,76 @@
  *   session UUID is issued and stored in KV (30-day TTL).
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import {
+  handleCheckColorContrast,
   handleDesignAudit,
   handleGetDesignGuidance,
   handlePaletteSuggest,
   handleSegmentPreset,
   handleWcagValidate,
+  PRESETS,
+  SEGMENT_PREVIEW_CENTERS,
 } from "./tools";
 import { SEGMENT_GUIDANCE, SEGMENT_KEYS, TOPIC_GUIDANCE, TOPIC_KEYS } from "./design-guidance";
 import { DEV_PATTERNS, EXAMPLE_URLS, RELATED_PATTERNS, SEGMENT_NOTES } from "./dev-patterns";
+import { validateExpression, getReference } from "./expression-validator";
+import { screenshotMap } from "./gl-map-renderer";
+import { type ClientMode, modeBriefText } from "./mode-brief";
+import { project, projectCoords, type Viewport } from "./projection";
 
-// ── Tool routing ────────────────────────────────────────────────────────────
+// ── Mode classification ──────────────────────────────────────────────────────
+//
+// This MCP serves two Figma products with different needs:
+//   • Figma Make  — interactive prototyping; full tool set.
+//   • Figma Design — static design only; hide tools that produce interactive
+//                    Mapbox GL JS code or drive a live interactive map.
+//
+// Integration:
+//   • Canonical: append  ?mode=design  to the MCP URL for Figma Design.
+//   • Alternative: send  X-Client-Mode: design  header (browser-safe — CORS
+//     allowHeaders includes it; use the query param in MCP config UIs that
+//     don't expose custom headers).
+// Figma Make uses /mcp  (default — fully backward-compatible).
 
-const MAPBOX_MCP_URL = "https://mcp.mapbox.com/mcp";
-const DEVKIT_MCP_URL = "https://mcp-devkit.mapbox.com/mcp";
-
-const MAPBOX_MCP_TOOLS = new Set([
-  "geocode",
-  "isochrone",
-  "matrix",
-  "static_map",
-  // category_search is implemented directly below (direct Search Box API call)
+/** Tools that only make sense in Figma Make (interactive prototyping).
+ *  Hidden from tools/list in Figma Design (static-only) mode. */
+export const INTERACTIVE_ONLY_TOOLS = new Set([
+  "get_dev_patterns",    // GL JS scaffolding / code patterns — requires a browser map
+  "directions",          // runtime routing for live interactive maps
+  "isochrone",           // travel-time contours — live map feature
+  "matrix",              // travel-time matrix   — live map feature
+  "category_search",     // live POI search for interactive layers
+  "validate_expression", // GL JS filter/paint expression dev helper
+  "get_reference",       // GL Style Spec dev docs
 ]);
 
-const DEVKIT_MCP_TOOLS = new Set([
-  "check_color_contrast",
-  "validate_expression",
-  "preview_style",
-  "get_reference",
+/** Tools that only make sense in Figma Design (static + projection).
+ *  Hidden from tools/list in Figma Make mode (which builds live GL JS maps). */
+export const DESIGN_ONLY_TOOLS = new Set([
+  "static_overlay",      // static image + geo→pixel projection for Figma editable overlays
 ]);
 
-// ── Proxy helper ────────────────────────────────────────────────────────────
+type McpTool = { name: string; description: string; inputSchema: unknown };
 
-async function proxyMcp(
-  upstream: string,
-  toolName: string,
-  input: Record<string, unknown>,
-  token: string
-): Promise<unknown> {
-  const res = await fetch(upstream, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: { name: toolName, arguments: input },
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(`Upstream ${upstream} returned ${res.status}: ${text}`);
-  }
+/** Return the tool list for the given mode. */
+export function toolsForMode(mode: ClientMode, tools: McpTool[]): McpTool[] {
+  if (mode === "make") return tools.filter((t) => !DESIGN_ONLY_TOOLS.has(t.name));
+  return tools.filter((t) => !INTERACTIVE_ONLY_TOOLS.has(t.name));
+}
 
-  const contentType = res.headers.get("content-type") ?? "";
-  let json: { result?: unknown; error?: { message?: string } };
-
-  if (contentType.includes("text/event-stream")) {
-    // Streamable HTTP transport: scan SSE lines for a data: payload
-    const text = await res.text();
-    const dataLine = text.split("\n").find((l) => l.startsWith("data:"));
-    if (!dataLine) throw new Error("No data line in SSE response from upstream MCP");
-    json = JSON.parse(dataLine.slice(5).trim()) as typeof json;
-  } else {
-    json = (await res.json()) as typeof json;
-  }
-
-  if (json.error) throw new Error(json.error.message ?? "Upstream MCP error");
-  return json.result;
+/** Read the client mode from:
+ *  1. ?mode=design|make  query param
+ *  2. X-Client-Mode: design|make  header
+ *  3. Default "make"  (backward-compatible — existing clients keep full capability)
+ */
+function getRequestMode(c: Context<{ Bindings: Env }>): ClientMode {
+  const q = c.req.query("mode");
+  if (q === "design" || q === "make") return q;
+  const h = c.req.header("X-Client-Mode");
+  if (h === "design" || h === "make") return h;
+  return "make";
 }
 
 // ── Auth helpers ─────────────────────────────────────────────────────────────
@@ -99,11 +95,92 @@ function getUserNameFromToken(token: string): string {
 
 async function getMapboxToken(authHeader: string | undefined, env: Env): Promise<string | null> {
   const bearer = authHeader?.replace(/^Bearer\s+/i, "").trim();
-  // Dev fallback: when KV not configured, accept env token for local wrangler dev
   if (!bearer || bearer === "public") {
     return env.SESSIONS ? null : (env.MAPBOX_TOKEN ?? null);
   }
   return env.SESSIONS.get(`session:${bearer}`);
+}
+
+async function getPublicToken(authHeader: string | undefined, env: Env): Promise<string | null> {
+  const bearer = authHeader?.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer || bearer === "public") return null;
+  return env.SESSIONS.get(`session:${bearer}:pk`);
+}
+
+/** Resolve an address string or "lng,lat" coordinate string to [lng, lat].
+ *  Coordinates pass through; addresses are geocoded via Mapbox Geocoding API. */
+async function geocodeOne(query: string, token: string): Promise<[number, number]> {
+  if (/^-?\d+\.?\d*,-?\d+\.?\d*$/.test(query.trim())) {
+    const [lng, lat] = query.trim().split(",").map(Number);
+    return [lng, lat];
+  }
+  const res = await fetch(
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json?access_token=${token}&limit=1`
+  );
+  if (!res.ok) throw new Error(`Geocoding error ${res.status} for "${query}"`);
+  const json = await res.json() as { features?: Array<{ center: [number, number] }> };
+  const feature = json.features?.[0];
+  if (!feature) throw new Error(`Could not geocode: "${query}"`);
+  return feature.center;
+}
+
+// ── Reusable Mapbox REST fetch helpers ────────────────────────────────────────
+
+async function fetchDirectionsGeometry(
+  waypoints: string[],
+  profile: string,
+  token: string,
+): Promise<{ coordinates: [number, number][]; distance: number; duration: number }> {
+  const coords = await Promise.all(waypoints.map((wp) => geocodeOne(wp, token)));
+  const coordStr = coords.map(([lng, lat]) => `${lng},${lat}`).join(";");
+  const res = await fetch(
+    `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coordStr}?access_token=${token}&geometries=geojson&steps=false&overview=full`,
+  );
+  if (!res.ok) throw new Error(`Mapbox Directions API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+  const json = await res.json() as { routes?: Array<{ geometry: { coordinates: [number, number][] }; distance: number; duration: number }> };
+  const route = json.routes?.[0];
+  if (!route) throw new Error("Directions API returned no routes");
+  return { coordinates: route.geometry.coordinates, distance: route.distance, duration: route.duration };
+}
+
+interface IsochroneFeature {
+  contour_minutes: number;
+  /** Outer ring + holes (each an array of [lng,lat] pairs). */
+  rings: [number, number][][];
+}
+
+async function fetchIsochronePolygons(
+  location: string,
+  contours_minutes: number[],
+  profile: string,
+  token: string,
+): Promise<IsochroneFeature[]> {
+  const [lng, lat] = await geocodeOne(location, token);
+  const params = new URLSearchParams({
+    access_token: token,
+    contours_minutes: contours_minutes.join(","),
+    polygons: "true",
+  });
+  const res = await fetch(
+    `https://api.mapbox.com/isochrone/v1/mapbox/${profile}/${lng},${lat}?${params}`,
+  );
+  if (!res.ok) throw new Error(`Mapbox Isochrone API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+  const json = await res.json() as {
+    features?: Array<{
+      properties: { contour: number };
+      geometry: { type: string; coordinates: [number, number][][] | [number, number][][][] };
+    }>;
+  };
+  return (json.features ?? []).map((f) => {
+    const contour = f.properties.contour;
+    // Polygon → one ring array; MultiPolygon → flatten to ring arrays
+    const coords = f.geometry.coordinates;
+    const rings: [number, number][][] =
+      f.geometry.type === "MultiPolygon"
+        ? (coords as [number, number][][][]).flat()
+        : (coords as [number, number][][]);
+    return { contour_minutes: contour, rings };
+  });
 }
 
 // ── Consent page HTML ─────────────────────────────────────────────────────────
@@ -123,9 +200,12 @@ function consentPageHtml(nonce: string, error?: string): string {
   .sub{color:#888;font-size:13px;margin-bottom:24px;line-height:1.5}
   .sub a{color:#4d9fff;text-decoration:none}
   label{display:block;font-size:12px;font-weight:500;color:#aaa;margin-bottom:6px;letter-spacing:.04em;text-transform:uppercase}
-  input{width:100%;background:#111;border:1px solid #333;border-radius:6px;padding:10px 12px;color:#e8e8e8;font-size:14px;font-family:monospace;outline:none}
+  .optional{font-size:10px;font-weight:400;color:#555;margin-left:6px;text-transform:none;letter-spacing:0}
+  input{width:100%;background:#111;border:1px solid #333;border-radius:6px;padding:10px 12px;color:#e8e8e8;font-size:14px;font-family:monospace;outline:none;margin-bottom:16px}
   input:focus{border-color:#4d9fff}
   .scopes{background:#111;border:1px solid #2a2a2a;border-radius:6px;padding:10px 12px;font-size:12px;color:#888;font-family:monospace;margin:12px 0 20px;line-height:1.8}
+  .divider{border:none;border-top:1px solid #2a2a2a;margin:20px 0}
+  .hint{font-size:12px;color:#555;margin:-12px 0 16px;line-height:1.5}
   button{width:100%;background:#4d9fff;color:#fff;border:none;border-radius:6px;padding:11px;font-size:14px;font-weight:600;cursor:pointer;margin-top:4px}
   button:hover{background:#3d8fee}
   .error{background:#2a1010;border:1px solid #5a2020;border-radius:6px;padding:10px 12px;font-size:13px;color:#ff7070;margin-bottom:16px}
@@ -134,14 +214,20 @@ function consentPageHtml(nonce: string, error?: string): string {
 <body>
 <div class="card">
   <h1>Connect Map Design MCP</h1>
-  <p class="sub">Paste a Mapbox <strong>secret key</strong> (<code>sk.*</code>) to authorise this server.<br>
-  <a href="https://account.mapbox.com/access-tokens" target="_blank" rel="noopener">Create a token →</a></p>
+  <p class="sub">Authorise with your Mapbox tokens to enable all map design tools.<br>
+  <a href="https://account.mapbox.com/access-tokens" target="_blank" rel="noopener">Manage tokens →</a></p>
   ${error ? `<div class="error">${error}</div>` : ""}
   <form method="POST" action="/authorize/submit?nonce=${nonce}">
-    <label>Required scopes</label>
+    <label>Secret key <code style="font-size:11px;color:#4d9fff">sk.*</code> — required</label>
     <div class="scopes">styles:read &nbsp; styles:list &nbsp; styles:write<br>styles:delete &nbsp; tokens:read &nbsp; tokens:write</div>
-    <label for="token">Mapbox secret key</label>
     <input id="token" name="token" type="password" placeholder="sk.eyJ1…" autocomplete="off" required>
+
+    <hr class="divider">
+
+    <label>Public key <code style="font-size:11px;color:#3fb950">pk.*</code><span class="optional">optional — for static map images</span></label>
+    <p class="hint">Required for <strong>static_map</strong>. Any public token works — use a scopes-restricted one for safety.</p>
+    <input id="pk_token" name="pk_token" type="password" placeholder="pk.eyJ1… (optional)" autocomplete="off">
+
     <button type="submit">Authorise</button>
   </form>
 </div>
@@ -151,10 +237,13 @@ function consentPageHtml(nonce: string, error?: string): string {
 
 // ── App ─────────────────────────────────────────────────────────────────────
 
-type Env = { SESSIONS: KVNamespace; MAPBOX_TOKEN?: string };
+type Env = { SESSIONS: KVNamespace; MAPBOX_TOKEN?: string; BROWSER: Fetcher };
 
 const app = new Hono<{ Bindings: Env }>();
-app.use("/*", cors({ origin: "*" }));
+app.use("/*", cors({
+  origin: "*",
+  allowHeaders: ["Authorization", "Content-Type", "X-Client-Mode"],
+}));
 
 // ── OAuth 2.0 discovery (MCP 2025-03-26 spec) ──────────────────────────────
 
@@ -239,6 +328,7 @@ app.post("/authorize/submit", async (c) => {
   const { nonce } = c.req.query();
   const body = await c.req.parseBody();
   const token = (body.token as string | undefined)?.trim() ?? "";
+  const pkToken = (body.pk_token as string | undefined)?.trim() ?? "";
 
   const pending = await c.env.SESSIONS.get(`nonce:${nonce}`);
   if (!pending) return c.text("Session expired. Please go back and try again.", 400);
@@ -248,13 +338,13 @@ app.post("/authorize/submit", async (c) => {
 
   // Basic JWT format check
   if (token.split(".").length !== 3)
-    return c.html(consentPageHtml(nonce, "Invalid token format — Mapbox tokens have three dot-separated parts."));
+    return c.html(consentPageHtml(nonce, "Invalid secret token format — Mapbox tokens have three dot-separated parts."));
 
-  // Reject public tokens — this server requires a secret token
+  // sk.* required for the main token field
   if (token.startsWith("pk."))
-    return c.html(consentPageHtml(nonce, "Public tokens (pk.*) cannot be used here. This server requires a secret token (sk.*) with the scopes listed above. Create one at account.mapbox.com/access-tokens."));
+    return c.html(consentPageHtml(nonce, "The first field requires a secret token (sk.*). Paste your public token (pk.*) in the second field below."));
 
-  // Validate the token decodes a username and check required scopes
+  // Validate sk.* decodes a username and has required scopes
   try {
     getUserNameFromToken(token);
     const parts = token.split(".");
@@ -265,16 +355,24 @@ app.post("/authorize/submit", async (c) => {
       const required = ["styles:read", "styles:list", "styles:write", "tokens:read", "tokens:write"];
       const missing = required.filter(s => !tokenScopes.includes(s));
       if (missing.length > 0)
-        return c.html(consentPageHtml(nonce, `Token is missing required scopes: ${missing.join(", ")}. Add them at account.mapbox.com/access-tokens.`));
+        return c.html(consentPageHtml(nonce, `Secret token is missing required scopes: ${missing.join(", ")}. Add them at account.mapbox.com/access-tokens.`));
     }
   } catch {
-    return c.html(consentPageHtml(nonce, "Could not read username from token. Make sure it is a valid Mapbox token."));
+    return c.html(consentPageHtml(nonce, "Could not read username from secret token. Make sure it is a valid Mapbox sk.* token."));
+  }
+
+  // Validate pk.* if provided
+  if (pkToken) {
+    if (pkToken.split(".").length !== 3)
+      return c.html(consentPageHtml(nonce, "Invalid public token format. Leave the field empty if you don't have one."));
+    if (!pkToken.startsWith("pk."))
+      return c.html(consentPageHtml(nonce, "The second field must be a public token (pk.*), not a secret token."));
   }
 
   const sessionCode = crypto.randomUUID();
   await c.env.SESSIONS.put(
     `code:${sessionCode}`,
-    JSON.stringify({ mapboxToken: token, codeChallenge: code_challenge }),
+    JSON.stringify({ mapboxToken: token, pkToken: pkToken || null, codeChallenge: code_challenge }),
     { expirationTtl: 300 },
   );
   await c.env.SESSIONS.delete(`nonce:${nonce}`);
@@ -297,7 +395,9 @@ app.post("/oauth/token", async (c) => {
   const raw = await c.env.SESSIONS.get(`code:${code}`);
   if (!raw || raw === "used")
     return c.json({ error: "invalid_grant", error_description: "invalid or expired code" }, 400);
-  const { mapboxToken, codeChallenge } = JSON.parse(raw) as { mapboxToken: string; codeChallenge?: string };
+  const { mapboxToken, pkToken, codeChallenge } = JSON.parse(raw) as {
+    mapboxToken: string; pkToken?: string | null; codeChallenge?: string;
+  };
 
   // PKCE validation (S256)
   if (codeChallenge) {
@@ -314,6 +414,9 @@ app.post("/oauth/token", async (c) => {
   await c.env.SESSIONS.put(`code:${code}`, "used", { expirationTtl: 60 });
   const sessionId = crypto.randomUUID();
   await c.env.SESSIONS.put(`session:${sessionId}`, mapboxToken, { expirationTtl: 2592000 });
+  if (pkToken) {
+    await c.env.SESSIONS.put(`session:${sessionId}:pk`, pkToken, { expirationTtl: 2592000 });
+  }
 
   return c.json({ access_token: sessionId, token_type: "bearer", expires_in: 2592000 });
 });
@@ -330,6 +433,9 @@ const MCP_TOOLS = [
       {
         name: "get_dev_patterns",
           description:
+            "⚠️ Figma Make (interactive prototyping) only. " +
+            "For static Figma Design work do NOT implement an interactive map — " +
+            "use static_map / segment_preset for images and get_design_guidance for UI recommendations. " +
             "Get Mapbox GL JS implementation patterns. " +
             "CALL ORDER: always call get_dev_patterns(pattern='scaffolding') FIRST on any new map — " +
             "it contains the mandatory token setup (list_tokens_tool → create_token_tool) and the " +
@@ -477,7 +583,7 @@ const MCP_TOOLS = [
       },
       {
         name: "directions",
-        description: "Get turn-by-turn directions between two or more waypoints.",
+        description: "⚠️ Figma Make only. Get turn-by-turn directions between two or more waypoints for a live interactive map.",
         inputSchema: {
           type: "object",
           properties: {
@@ -492,7 +598,7 @@ const MCP_TOOLS = [
       },
       {
         name: "isochrone",
-        description: "Generate travel-time or distance contours (isochrones) around a location.",
+        description: "⚠️ Figma Make only. Generate travel-time or distance contours (isochrones) around a location — for live interactive maps.",
         inputSchema: {
           type: "object",
           properties: {
@@ -505,7 +611,7 @@ const MCP_TOOLS = [
       },
       {
         name: "matrix",
-        description: "Compute a travel-time or distance matrix between origins and destinations.",
+        description: "⚠️ Figma Make only. Compute a travel-time or distance matrix between origins and destinations — for live interactive maps.",
         inputSchema: {
           type: "object",
           properties: {
@@ -518,22 +624,112 @@ const MCP_TOOLS = [
       },
       {
         name: "static_map",
-        description: "Generate a static map image URL for a given location, style, and viewport.",
+        description:
+          "Render and return a map as an image (MCP image content — embedded directly, no URL needed). " +
+          "Available in both Figma Design (static deliverable) and Figma Make (quick preview during iteration). " +
+          "Default renderer is 'webgl' (Mapbox GL JS in headless Chrome) using mapbox/standard — supports 3D buildings, " +
+          "lightPreset, landmark icons, pitch/bearing, and all Standard config (~5-10s). " +
+          "Use renderer='static' ONLY for speed-critical cases or when the user explicitly requests a Classic style — " +
+          "'static' uses the Mapbox Static Images API (fast ~500ms) but is Classic styles only (streets-v12, dark-v11, etc.). " +
+          "Use segment= to auto-apply cartographic presets and default camera position. " +
+          "To place pins, routes, or isochrones at real geographic coordinates on top of the image in Figma Design, use static_overlay instead.",
         inputSchema: {
           type: "object",
           properties: {
-            center: { type: "array", items: { type: "number" }, description: "[lng, lat]" },
-            zoom: { type: "number" },
-            width: { type: "number" },
-            height: { type: "number" },
-            style: { type: "string" },
+            center: { type: "array", items: { type: "number" }, description: "[lng, lat] — optional if segment= is provided" },
+            zoom: { type: "number", description: "Zoom level — optional if segment= is provided" },
+            width: { type: "number", description: "Image width in pixels (default 600)" },
+            height: { type: "number", description: "Image height in pixels (default 400)" },
+            bearing: { type: "number", description: "Camera rotation in degrees 0–360 (default 0 = north-up)" },
+            pitch: { type: "number", description: "Camera tilt in degrees 0–60 (default 0 = top-down; 45–60 = dramatic 3D perspective)" },
+            retina: { type: "boolean", description: "Return @2x high-DPI image (default false)" },
+            style: { type: "string", description: "Mapbox style. Defaults to 'mapbox/standard' (recommended — rendered via webgl). Pass a Classic style ONLY if you specifically need the fast Static Images API path or the user explicitly requests it: 'mapbox/streets-v12', 'mapbox/light-v11', 'mapbox/dark-v11', 'mapbox/outdoors-v12', 'mapbox/satellite-v9', 'mapbox/satellite-streets-v12'. Or a custom 'username/styleId'. Classic styles render via the Static Images API; mapbox/standard renders via webgl." },
+            segment: {
+              type: "string",
+              enum: SEGMENT_KEYS,
+              description: "Apply segment-tuned Standard style config and auto-fill center/zoom if not provided",
+            },
+            standard_config: {
+              type: "object",
+              description: "Standard style config overrides: lightPreset (day/dusk/dawn/night), colorLand, colorWater, colorRoad, show3dBuildings, showPlaceLabels, etc. Auto-selects webgl renderer.",
+            },
+            renderer: {
+              type: "string",
+              enum: ["webgl", "static"],
+              description: "'webgl' = full GL JS render via headless Chrome — supports mapbox/standard, 3D, all Standard config (~5-10s). Default for mapbox/standard. 'static' = Mapbox Static Images API — fast (~500ms) but Classic styles only; use only when speed matters or user asks for a Classic style. Default: auto (webgl for Standard, static for Classic).",
+            },
+          },
+        },
+      },
+      {
+        name: "static_overlay",
+        description:
+          "Figma Design mode only. Render a static map image AND project geographic features (pins, routes, isochrones) " +
+          "to exact {x,y} pixel coordinates relative to that image, so Figma can place them as real, editable vector layers " +
+          "on top of the map. Camera is always explicit (center + zoom required). " +
+          "Routes and isochrones are fetched server-side — no interactive code needed. " +
+          "Returns: _image (embedded image), viewport (the camera transform), and overlays.{markers,routes,isochrones} " +
+          "each with pixel {x,y,in_view} per point. " +
+          "Note: returned {x,y} coords are in logical (non-retina) pixels — if retina=true the image bytes are 2×, " +
+          "but Figma should size the image frame to width×height and use the logical pixel coords.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            center: { type: "array", items: { type: "number" }, description: "[lng, lat] of the map center (required)" },
+            zoom: { type: "number", description: "Zoom level (required)" },
+            width: { type: "number", description: "Image width in logical pixels (default 600)" },
+            height: { type: "number", description: "Image height in logical pixels (default 400)" },
+            bearing: { type: "number", description: "Map rotation in degrees 0–360 (default 0 = north-up)" },
+            retina: { type: "boolean", description: "Return @2x high-DPI image bytes (default false). Pixel coords are still in logical px." },
+            style: { type: "string", description: "Mapbox style — defaults to 'mapbox/standard'. Classic styles use the fast Static Images API." },
+            segment: { type: "string", enum: SEGMENT_KEYS, description: "Apply segment-tuned Standard config to the basemap" },
+            standard_config: { type: "object", description: "Standard style config overrides (lightPreset, colorLand, show3dBuildings, etc.)" },
+            markers: {
+              type: "array",
+              description: "Point features to project. Each projected to {lng,lat,x,y,in_view,label?}.",
+              items: {
+                type: "object",
+                properties: {
+                  lng: { type: "number" },
+                  lat: { type: "number" },
+                  label: { type: "string", description: "Optional text label for the pin" },
+                  color: { type: "string", description: "Optional hex color hint for the pin (#rrggbb)" },
+                },
+                required: ["lng", "lat"],
+              },
+            },
+            routes: {
+              type: "array",
+              description: "Routes to fetch (Directions API) and project. Each projected to {distance,duration,coordinates,pixels}.",
+              items: {
+                type: "object",
+                properties: {
+                  waypoints: { type: "array", items: { type: "string" }, description: "Addresses or 'lng,lat' strings" },
+                  profile: { type: "string", enum: ["driving", "walking", "cycling"], description: "Default 'driving'" },
+                },
+                required: ["waypoints"],
+              },
+            },
+            isochrones: {
+              type: "array",
+              description: "Isochrones to fetch and project. Each feature's ring vertices projected to pixel coords.",
+              items: {
+                type: "object",
+                properties: {
+                  location: { type: "string", description: "Address or 'lng,lat'" },
+                  contours_minutes: { type: "array", items: { type: "number" }, description: "Travel-time contours in minutes, e.g. [5,10,15]" },
+                  profile: { type: "string", enum: ["driving", "walking", "cycling"], description: "Default 'driving'" },
+                },
+                required: ["location", "contours_minutes"],
+              },
+            },
           },
           required: ["center", "zoom"],
         },
       },
       {
         name: "category_search",
-        description: "Search for POIs or places by category near a location.",
+        description: "⚠️ Figma Make only. Search for POIs or places by category near a location — for populating interactive map layers.",
         inputSchema: {
           type: "object",
           properties: {
@@ -632,15 +828,17 @@ const MCP_TOOLS = [
         inputSchema: {
           type: "object",
           properties: {
-            foreground: { type: "string" },
-            background: { type: "string" },
+            foreground: { type: "string", description: "Foreground color (hex, e.g. #333333)" },
+            background: { type: "string", description: "Background color (hex, e.g. #ffffff)" },
+            level: { type: "string", enum: ["AA", "AAA"], description: "WCAG level to test (default AA)" },
+            fontSize: { type: "string", enum: ["normal", "large"], description: "Text size — large = 18pt+/14pt bold (default normal)" },
           },
           required: ["foreground", "background"],
         },
       },
       {
         name: "validate_expression",
-        description: "Validate a Mapbox GL filter or paint expression. Returns valid/invalid and error details.",
+        description: "⚠️ Figma Make only. Validate a Mapbox GL filter or paint expression — a GL JS dev helper for interactive maps.",
         inputSchema: {
           type: "object",
           properties: {
@@ -651,19 +849,21 @@ const MCP_TOOLS = [
       },
       {
         name: "preview_style",
-        description: "Generate a preview image URL for a Mapbox style.",
+        description: "Generate an interactive HTML preview URL for a Mapbox style. Open the returned URL in a browser to see the style live.",
         inputSchema: {
           type: "object",
           properties: {
-            style: { type: "string", description: "Style URL (mapbox://styles/...)" },
+            styleId: { type: "string", description: "Style ID (the part after the username in mapbox://styles/username/STYLE_ID)" },
+            title: { type: "string", description: "Optional title to display in the preview" },
+            zoomwheel: { type: "boolean", description: "Enable scroll-to-zoom (default true)" },
           },
-          required: ["style"],
+          required: ["styleId"],
         },
       },
       {
         name: "get_reference",
         description:
-          "Look up Mapbox Style Spec documentation for a property, layer type, or expression operator.",
+          "⚠️ Figma Make only. Look up Mapbox Style Spec documentation for a property, layer type, or expression operator — GL JS dev reference.",
         inputSchema: {
           type: "object",
           properties: {
@@ -706,6 +906,21 @@ const MCP_PROMPTS = [
       {
         name: "topic",
         description: `One of: ${TOPIC_KEYS.join(", ")}`,
+        required: true,
+      },
+    ],
+  },
+  {
+    name: "mode_brief",
+    description:
+      "Inject at conversation start to brief the agent on which Figma product it is operating in. " +
+      "Figma Design → static map images + UI/design recommendations + style CRUD only (no interactive GL JS). " +
+      "Figma Make → full interactive Mapbox GL JS prototyping. " +
+      "Pass mode='design' or mode='make'.",
+    arguments: [
+      {
+        name: "mode",
+        description: "Either 'design' (Figma Design — static only) or 'make' (Figma Make — interactive)",
         required: true,
       },
     ],
@@ -813,16 +1028,23 @@ function buildPromptMessages(
     return [{ role: "user", content: { type: "text", text: lines.join("\n") } }];
   }
 
+  if (name === "mode_brief") {
+    const mode: ClientMode = args.mode === "design" ? "design" : "make";
+    return [{ role: "user", content: { type: "text", text: modeBriefText(mode) } }];
+  }
+
   throw new Error(`Unknown prompt: "${name}". Available: ${MCP_PROMPTS.map((p) => p.name).join(", ")}`);
 }
 
-app.get("/mcp", (c) =>
-  c.json({
+app.get("/mcp", (c) => {
+  const mode = getRequestMode(c);
+  return c.json({
     ...MCP_SERVER_INFO,
     description: "Map Studio MCP gateway — cartographic design tools, Mapbox geocoding/routing/isochrone, and style DevKit",
-    tools: MCP_TOOLS,
-  })
-);
+    mode,
+    tools: toolsForMode(mode, MCP_TOOLS),
+  });
+});
 
 // ── Tool execution core ───────────────────────────────────────────────────────
 
@@ -830,6 +1052,8 @@ async function executeTool(
   toolName: string,
   input: Record<string, unknown>,
   mapboxToken: string | null,
+  publicToken: string | null = null,
+  env: Env | null = null,
 ): Promise<unknown> {
   // ── No-auth tools ────────────────────────────────────────────────────────
   switch (toolName) {
@@ -893,10 +1117,15 @@ async function executeTool(
     case "update_style_tool": {
       const { styleId, name, style } = input as { styleId: string; name?: string; style?: object };
       const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const payload: Record<string, unknown> = {};
+      const styleUrl = `https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`;
+      // Styles API PATCH requires the full style object — GET current first, then merge
+      const getRes = await fetch(styleUrl);
+      if (!getRes.ok) throw new Error(`Mapbox Styles API error ${getRes.status}: ${await getRes.text().catch(() => getRes.statusText)}`);
+      const current = await getRes.json() as Record<string, unknown>;
+      const payload: Record<string, unknown> = { ...current };
       if (name) payload.name = name;
       if (style) Object.assign(payload, style);
-      const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`, {
+      const res = await fetch(styleUrl, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -939,72 +1168,391 @@ async function executeTool(
     }
     case "directions": {
       const { waypoints, profile = "driving" } = input as { waypoints: string[]; profile?: string };
-      const coords: string[] = [];
-      for (const wp of waypoints) {
-        if (/^-?\d+\.?\d*,-?\d+\.?\d*$/.test(wp.trim())) {
-          coords.push(wp.trim());
-        } else {
-          const geoRes = await fetch(
-            `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(wp)}.json?access_token=${mapboxToken}&limit=1`
-          );
-          if (!geoRes.ok) throw new Error(`Geocoding error ${geoRes.status} for waypoint "${wp}"`);
-          const geoJson = await geoRes.json() as { features?: Array<{ center: [number, number] }> };
-          const feature = geoJson.features?.[0];
-          if (!feature) throw new Error(`Could not geocode waypoint: "${wp}"`);
-          coords.push(`${feature.center[0]},${feature.center[1]}`);
-        }
-      }
+      // Use full steps=true response for the interactive tool (richer than the helper's overview-only fetch)
+      const coords = await Promise.all((waypoints as string[]).map((wp) => geocodeOne(wp, mapboxToken)));
+      const coordStr = coords.map(([lng, lat]) => `${lng},${lat}`).join(";");
       const res = await fetch(
-        `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coords.join(";")}?access_token=${mapboxToken}&geometries=geojson&steps=true&overview=full`
+        `https://api.mapbox.com/directions/v5/mapbox/${profile}/${coordStr}?access_token=${mapboxToken}&geometries=geojson&steps=true&overview=full`
       );
       if (!res.ok) throw new Error(`Mapbox Directions API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
       return res.json();
     }
 
     case "category_search": {
-    const { category, proximity, limit = 5 } = input as { category: string; proximity?: string; limit?: number };
-    const params = new URLSearchParams({
-      access_token: mapboxToken,
-      limit: String(Math.min(limit, 10)),
-      language: "en",
-    });
-    if (proximity) {
-      const isCoord = /^-?\d+\.?\d*,-?\d+\.?\d*$/.test(proximity.trim());
-      if (isCoord) {
-        params.set("proximity", proximity.trim());
-      } else {
-        const geoRes = await fetch(
-          `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(proximity)}.json?access_token=${mapboxToken}&limit=1`
-        );
-        if (geoRes.ok) {
-          const geoJson = await geoRes.json() as { features?: Array<{ center: [number, number] }> };
-          const center = geoJson.features?.[0]?.center;
-          if (center) params.set("proximity", `${center[0]},${center[1]}`);
-        }
+      const { category, proximity, limit = 5 } = input as { category: string; proximity?: string; limit?: number };
+      const params = new URLSearchParams({
+        access_token: mapboxToken,
+        limit: String(Math.min(limit as number, 10)),
+        language: "en",
+      });
+      if (proximity) {
+        try {
+          const [lng, lat] = await geocodeOne(proximity as string, mapboxToken);
+          params.set("proximity", `${lng},${lat}`);
+        } catch { /* proximity is optional — continue without it */ }
       }
+      const res = await fetch(
+        `https://api.mapbox.com/search/searchbox/v1/category/${encodeURIComponent(category as string)}?${params}`
+      );
+      if (!res.ok) throw new Error(`Mapbox Search API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+      const json = await res.json() as { features?: Array<{ properties: Record<string, unknown>; geometry: { coordinates: [number, number] } }> };
+      return {
+        results: (json.features ?? []).map((f) => ({
+          name: f.properties.name,
+          category: f.properties.poi_category,
+          coordinates: f.geometry.coordinates,
+          address: f.properties.full_address ?? f.properties.address,
+          mapbox_id: f.properties.mapbox_id,
+        })),
+      };
     }
-    const res = await fetch(
-      `https://api.mapbox.com/search/searchbox/v1/category/${encodeURIComponent(category)}?${params}`
-    );
-    if (!res.ok) throw new Error(`Mapbox Search API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-    const json = await res.json() as { features?: Array<{ properties: Record<string, unknown>; geometry: { coordinates: [number, number] } }> };
-    return {
-      results: (json.features ?? []).map((f) => ({
-        name: f.properties.name,
-        category: f.properties.poi_category,
-        coordinates: f.geometry.coordinates,
-        address: f.properties.full_address ?? f.properties.address,
-        mapbox_id: f.properties.mapbox_id,
-      })),
-    };
-  }
-  } // end switch
 
-  // Mapbox MCP / DevKit MCP proxy
-  if (MAPBOX_MCP_TOOLS.has(toolName) || DEVKIT_MCP_TOOLS.has(toolName)) {
-    const upstream = MAPBOX_MCP_TOOLS.has(toolName) ? MAPBOX_MCP_URL : DEVKIT_MCP_URL;
-    return proxyMcp(upstream, toolName, input, mapboxToken);
-  }
+    // ── Previously-proxied Mapbox REST tools (now implemented natively) ────────
+
+    case "geocode": {
+      const { query } = input as { query: string };
+      // Detect reverse geocode: "lng,lat"
+      const isReverse = /^-?\d+\.?\d*,-?\d+\.?\d*$/.test(query.trim());
+      const endpoint = isReverse
+        ? `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query.trim())}.json`
+        : `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(query)}.json`;
+      const res = await fetch(`${endpoint}?access_token=${mapboxToken}&limit=5`);
+      if (!res.ok) throw new Error(`Mapbox Geocoding API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+      return res.json();
+    }
+
+    case "isochrone": {
+      const { location, contours_minutes, profile = "driving" } = input as {
+        location: string;
+        contours_minutes: number[];
+        profile?: string;
+      };
+      const [lng, lat] = await geocodeOne(location, mapboxToken);
+      const params = new URLSearchParams({
+        access_token: mapboxToken,
+        contours_minutes: (contours_minutes as number[]).join(","),
+        polygons: "true",
+      });
+      const res = await fetch(
+        `https://api.mapbox.com/isochrone/v1/mapbox/${profile}/${lng},${lat}?${params}`
+      );
+      if (!res.ok) throw new Error(`Mapbox Isochrone API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+      return res.json(); // raw GeoJSON for the interactive tool
+    }
+
+    case "matrix": {
+      const { origins, destinations, profile = "driving" } = input as {
+        origins: string[];
+        destinations: string[];
+        profile?: string;
+      };
+      const originCoords = await Promise.all((origins as string[]).map((o) => geocodeOne(o, mapboxToken)));
+      const destCoords = await Promise.all((destinations as string[]).map((d) => geocodeOne(d, mapboxToken)));
+      const allCoords = [...originCoords, ...destCoords];
+      const coordStr = allCoords.map(([lng, lat]) => `${lng},${lat}`).join(";");
+      const sourceIdx = originCoords.map((_, i) => i).join(";");
+      const destIdx = destCoords.map((_, i) => originCoords.length + i).join(";");
+      const params = new URLSearchParams({
+        access_token: mapboxToken,
+        annotations: "duration,distance",
+        sources: sourceIdx,
+        destinations: destIdx,
+      });
+      const res = await fetch(
+        `https://api.mapbox.com/directions-matrix/v1/mapbox/${profile}/${coordStr}?${params}`
+      );
+      if (!res.ok) throw new Error(`Mapbox Matrix API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+      return res.json();
+    }
+
+    case "static_map": {
+      const {
+        width = 600,
+        height = 400,
+        bearing = 0,
+        pitch = 0,
+        retina = false,
+        style,
+        segment,
+        standard_config,
+        renderer,
+      } = input as {
+        center?: [number, number];
+        zoom?: number;
+        width?: number;
+        height?: number;
+        bearing?: number;
+        pitch?: number;
+        retina?: boolean;
+        style?: string;
+        segment?: string;
+        standard_config?: Record<string, unknown>;
+        renderer?: "webgl" | "static";
+      };
+
+      // pk.* token required — needed for both renderers
+      const token = publicToken ?? (mapboxToken.startsWith("pk.") ? mapboxToken : null);
+      if (!token) {
+        throw new Error(
+          "static_map requires a public (pk.*) token. " +
+          "Re-authorise the MCP server and paste your pk.* token in the 'Public key' field on the consent page."
+        );
+      }
+
+      // Resolve center/zoom: explicit input → segment default → error
+      let center = input.center as [number, number] | undefined;
+      let zoom = input.zoom as number | undefined;
+      if (segment && SEGMENT_PREVIEW_CENTERS[segment] && (center === undefined || zoom === undefined)) {
+        const sc = SEGMENT_PREVIEW_CENTERS[segment];
+        center = center ?? [sc.lng, sc.lat];
+        zoom = zoom ?? sc.zoom;
+      }
+      if (center === undefined || zoom === undefined) {
+        throw new Error("static_map: provide center=[lng,lat] and zoom, or segment= to auto-fill.");
+      }
+
+      // Build Standard config entries (merged: segment preset + manual overrides)
+      const configEntries: Record<string, unknown> = {};
+      if (segment && PRESETS[segment]) Object.assign(configEntries, PRESETS[segment]);
+      if (standard_config && typeof standard_config === "object") Object.assign(configEntries, standard_config);
+
+      // Style resolution
+      const hasStandardConfig = Object.keys(configEntries).length > 0;
+      const resolvedStyle = style ?? "mapbox/standard";
+
+      // ── Renderer routing ──────────────────────────────────────────────────────
+      // WebGL (Cloudflare Browser Rendering): supports mapbox/standard, 3D, all Standard config
+      // Static Images API: fast (~500ms), classic styles only
+      const useWebGL =
+        renderer === "webgl" ||
+        (renderer !== "static" && (resolvedStyle === "mapbox/standard" || hasStandardConfig));
+
+      if (useWebGL) {
+        const imageData = await screenshotMap(
+          { center, zoom, bearing, pitch, width, height, style: resolvedStyle, standardConfig: configEntries, publicToken: token },
+          env!.BROWSER,
+        );
+        return {
+          _image: imageData,
+          renderer: "webgl",
+          width,
+          height,
+          center,
+          zoom,
+          bearing,
+          pitch,
+          style: resolvedStyle,
+          ...(hasStandardConfig ? { standard_config: configEntries } : {}),
+          // No url — image content is returned directly
+        };
+      }
+
+      // ── Static Images API path (fast, classic styles) ─────────────────────────
+      const [lng, lat] = center;
+      const sizeStr = retina ? `${width}x${height}@2x` : `${width}x${height}`;
+      const camera = pitch !== 0 ? `${lng},${lat},${zoom},${bearing},${pitch}` : `${lng},${lat},${zoom},${bearing}`;
+      const url =
+        `https://api.mapbox.com/styles/v1/${resolvedStyle}/static/` +
+        `${camera}/${sizeStr}` +
+        `?access_token=${token}`;
+
+      const imgRes = await fetch(url);
+      if (!imgRes.ok) {
+        const errText = await imgRes.text().catch(() => imgRes.statusText);
+        throw new Error(`Mapbox Static Images API error ${imgRes.status}: ${errText}`);
+      }
+      const buf = await imgRes.arrayBuffer();
+      const mimeType = imgRes.headers.get("content-type") ?? "image/jpeg";
+      const bytes = new Uint8Array(buf);
+      let binary = "";
+      const chunkSize = 8192;
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      const data = btoa(binary);
+
+      return {
+        _image: { data, mimeType },
+        renderer: "static",
+        width: retina ? width * 2 : width,
+        height: retina ? height * 2 : height,
+        center,
+        zoom,
+        style: resolvedStyle,
+        // No url — image content is returned directly
+      };
+    }
+
+    case "static_overlay": {
+      const {
+        center,
+        zoom,
+        width = 600,
+        height = 400,
+        bearing = 0,
+        retina = false,
+        style,
+        segment,
+        standard_config,
+        markers = [],
+        routes = [],
+        isochrones = [],
+      } = input as {
+        center: [number, number];
+        zoom: number;
+        width?: number;
+        height?: number;
+        bearing?: number;
+        retina?: boolean;
+        style?: string;
+        segment?: string;
+        standard_config?: Record<string, unknown>;
+        markers?: Array<{ lng: number; lat: number; label?: string; color?: string }>;
+        routes?: Array<{ waypoints: string[]; profile?: string }>;
+        isochrones?: Array<{ location: string; contours_minutes: number[]; profile?: string }>;
+      };
+
+      // pk.* token required for image rendering
+      const overlayToken = publicToken ?? (mapboxToken.startsWith("pk.") ? mapboxToken : null);
+      if (!overlayToken) {
+        throw new Error(
+          "static_overlay requires a public (pk.*) token. " +
+          "Re-authorise the MCP server and paste your pk.* token in the 'Public key' field."
+        );
+      }
+
+      // Build config (segment preset + manual overrides)
+      const overlayConfig: Record<string, unknown> = {};
+      if (segment && PRESETS[segment]) Object.assign(overlayConfig, PRESETS[segment]);
+      if (standard_config && typeof standard_config === "object") Object.assign(overlayConfig, standard_config);
+
+      const resolvedOverlayStyle = style ?? "mapbox/standard";
+      const hasOverlayConfig = Object.keys(overlayConfig).length > 0;
+      const useOverlayWebGL =
+        resolvedOverlayStyle === "mapbox/standard" || hasOverlayConfig;
+
+      // 1. Render static image (parallel with geometry fetches)
+      const renderPromise = useOverlayWebGL
+        ? screenshotMap(
+            { center, zoom, bearing, pitch: 0, width, height, style: resolvedOverlayStyle, standardConfig: overlayConfig, publicToken: overlayToken },
+            env!.BROWSER,
+          )
+        : (async () => {
+            const [lng, lat] = center;
+            const sizeStr = retina ? `${width}x${height}@2x` : `${width}x${height}`;
+            const cameraStr = `${lng},${lat},${zoom},${bearing}`;
+            const imgUrl =
+              `https://api.mapbox.com/styles/v1/${resolvedOverlayStyle}/static/` +
+              `${cameraStr}/${sizeStr}` +
+              `?access_token=${overlayToken}`;
+            const imgRes = await fetch(imgUrl);
+            if (!imgRes.ok) throw new Error(`Mapbox Static Images API error ${imgRes.status}: ${await imgRes.text().catch(() => imgRes.statusText)}`);
+            const buf = await imgRes.arrayBuffer();
+            const mimeType = imgRes.headers.get("content-type") ?? "image/jpeg";
+            const bytes = new Uint8Array(buf);
+            let binary = "";
+            const chunkSize = 8192;
+            for (let i = 0; i < bytes.length; i += chunkSize) {
+              binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+            }
+            return { data: btoa(binary), mimeType };
+          })();
+
+      // 2. Fetch geometry in parallel
+      const routePromises = routes.map((r) =>
+        fetchDirectionsGeometry(r.waypoints, r.profile ?? "driving", mapboxToken)
+      );
+      const isoPromises = isochrones.map((iso) =>
+        fetchIsochronePolygons(iso.location, iso.contours_minutes, iso.profile ?? "driving", mapboxToken)
+      );
+
+      const [imageData, ...restResults] = await Promise.all([
+        renderPromise,
+        ...routePromises,
+        ...isoPromises,
+      ]);
+
+      const routeResults = restResults.slice(0, routes.length) as Awaited<ReturnType<typeof fetchDirectionsGeometry>>[];
+      const isoResults = restResults.slice(routes.length) as Awaited<ReturnType<typeof fetchIsochronePolygons>>[];
+
+      // 3. Build viewport and project
+      const viewport: Viewport = { center, zoom, width, height, bearing };
+
+      const projectedMarkers = markers.map((m) => ({
+        lng: m.lng,
+        lat: m.lat,
+        ...(m.label ? { label: m.label } : {}),
+        ...(m.color ? { color: m.color } : {}),
+        ...project(m.lng, m.lat, viewport),
+      }));
+
+      const projectedRoutes = routeResults.map((r, i) => ({
+        profile: routes[i].profile ?? "driving",
+        distance: r.distance,
+        duration: r.duration,
+        coordinates: r.coordinates,
+        pixels: projectCoords(r.coordinates, viewport),
+      }));
+
+      const projectedIsochrones = isoResults.flatMap((features, i) =>
+        features.map((f) => ({
+          location: isochrones[i].location,
+          contour_minutes: f.contour_minutes,
+          rings: f.rings.map((ring) => projectCoords(ring, viewport)),
+        }))
+      );
+
+      return {
+        _image: imageData,
+        renderer: useOverlayWebGL ? "webgl" : "static",
+        viewport,
+        overlays: {
+          markers: projectedMarkers,
+          routes: projectedRoutes,
+          isochrones: projectedIsochrones,
+        },
+      };
+    }
+
+    // ── Previously-proxied DevKit tools (now implemented natively) ─────────────
+
+    case "check_color_contrast": {
+      const { foreground, background, level, fontSize } = input as {
+        foreground: string;
+        background: string;
+        level?: "AA" | "AAA";
+        fontSize?: "normal" | "large";
+      };
+      return handleCheckColorContrast({ foreground, background, level, fontSize });
+    }
+
+    case "validate_expression": {
+      const { expression } = input as { expression: unknown };
+      return validateExpression(expression);
+    }
+
+    case "preview_style": {
+      const { styleId, title, zoomwheel = true } = input as { styleId: string; title?: string; zoomwheel?: boolean };
+      const user = encodeURIComponent(getUserNameFromToken(mapboxToken));
+      const params = new URLSearchParams({ access_token: mapboxToken, fresh: "true" });
+      if (title) params.set("title", String(title));
+      if (!zoomwheel) params.set("zoomwheel", "false");
+      const url = `https://api.mapbox.com/styles/v1/${user}/${encodeURIComponent(styleId)}.html?${params}`;
+      return { url, styleId, note: "Open this URL in a browser to preview the style interactively." };
+    }
+
+    case "get_reference": {
+      const { topic } = input as { topic: string };
+      const result = getReference(topic);
+      if (result.found) return result.entry;
+      return {
+        found: false,
+        message: `No reference entry for "${topic}".`,
+        available_topics: result.available,
+      };
+    }
+
+  } // end switch
 
   throw new Error(`Unknown tool: ${toolName}`);
 }
@@ -1014,19 +1562,29 @@ async function executeTool(
 app.post("/mcp", async (c) => {
   const body = await c.req.json<Record<string, unknown>>();
   const base = `https://${c.req.header("host")}`;
-  const mapboxToken = await getMapboxToken(c.req.header("Authorization"), c.env);
+  const authHeader = c.req.header("Authorization");
+  const mapboxToken = await getMapboxToken(authHeader, c.env);
+  const publicToken = await getPublicToken(authHeader, c.env);
 
   // ── Standard MCP JSON-RPC protocol ────────────────────────────────────────
   if (body.jsonrpc === "2.0") {
     const { id, method, params } = body as { id: unknown; method: string; params?: Record<string, unknown> };
 
     if (method === "initialize") {
+      // Log clientInfo so we can later detect Figma Make vs Figma Design automatically.
+      // To inspect: run `wrangler tail` after connecting from each Figma product.
+      const clientInfo = (params as Record<string, unknown> | undefined)?.clientInfo;
+      console.log("[initialize] clientInfo:", JSON.stringify(clientInfo ?? null));
+      const initMode = getRequestMode(c);
       return c.json({
         jsonrpc: "2.0", id,
         result: {
           protocolVersion: "2024-11-05",
           capabilities: { tools: {}, prompts: { listChanged: false } },
-          serverInfo: { name: "map-design-mcp", version: "2.0.0" },
+          serverInfo: MCP_SERVER_INFO,
+          // Spec-sanctioned auto-delivered instructions — surfaces as a system prompt
+          // in compliant hosts so the agent knows its mode without fetching mode_brief.
+          instructions: modeBriefText(initMode),
         },
       });
     }
@@ -1036,14 +1594,27 @@ app.post("/mcp", async (c) => {
     }
 
     if (method === "tools/list") {
-      return c.json({ jsonrpc: "2.0", id, result: { tools: MCP_TOOLS } });
+      const mode = getRequestMode(c);
+      return c.json({ jsonrpc: "2.0", id, result: { tools: toolsForMode(mode, MCP_TOOLS) } });
     }
 
     if (method === "tools/call") {
       const toolName = (params?.name ?? "") as string;
       const input = (params?.arguments ?? {}) as Record<string, unknown>;
       try {
-        const result = await executeTool(toolName, input, mapboxToken);
+        const result = await executeTool(toolName, input, mapboxToken, publicToken, c.env);
+        // Image result: return only the image content block (no URL links per design decision)
+        if (result && typeof result === "object" && "_image" in (result as object)) {
+          const { _image } = result as { _image: { data: string; mimeType: string } };
+          return c.json({
+            jsonrpc: "2.0", id,
+            result: {
+              content: [
+                { type: "image", data: _image.data, mimeType: _image.mimeType },
+              ],
+            },
+          });
+        }
         const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         return c.json({
           jsonrpc: "2.0", id,
@@ -1085,7 +1656,7 @@ app.post("/mcp", async (c) => {
   // ── Legacy custom format (Map Studio backend) ─────────────────────────────
   const { tool, input = {} } = body as { tool: string; input?: Record<string, unknown> };
   try {
-    return c.json(await executeTool(tool, input, mapboxToken));
+    return c.json(await executeTool(tool, input, mapboxToken, publicToken, c.env));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return c.json({ error: msg }, 400);
