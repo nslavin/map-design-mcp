@@ -53,8 +53,19 @@ export function handleGetDesignGuidance(input: { segment?: string; topic?: strin
 
 // ── Color math helpers ────────────────────────────────────────────────────────
 
+/**
+ * Validate and parse a hex color string (#RGB or #RRGGBB) into [r, g, b] ∈ [0, 1].
+ * Throws a descriptive error on invalid input so callers get a clear message
+ * rather than a silent NaN that propagates as `passes: false` through WCAG checks.
+ */
 function hexToRgb(hex: string): [number, number, number] {
-  const clean = hex.replace("#", "").padEnd(6, "0").slice(0, 6);
+  if (typeof hex !== "string" || !/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(hex.trim())) {
+    throw new Error(
+      `Invalid hex color "${hex}" — expected #RGB or #RRGGBB (e.g. #fff or #ffffff).`
+    );
+  }
+  let clean = hex.trim().slice(1); // drop #
+  if (clean.length === 3) clean = clean[0]+clean[0]+clean[1]+clean[1]+clean[2]+clean[2]; // expand shorthand
   return [
     parseInt(clean.slice(0, 2), 16) / 255,
     parseInt(clean.slice(2, 4), 16) / 255,
@@ -101,7 +112,7 @@ function extractStaticHexColors(layer: Record<string, unknown>): string[] {
   const paint = layer.paint as Record<string, unknown> | undefined;
   if (!paint) return colors;
   for (const v of Object.values(paint)) {
-    if (typeof v === "string" && /^#[0-9a-fA-F]{3,6}$/.test(v)) colors.push(v);
+    if (typeof v === "string" && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(v)) colors.push(v);
   }
   return colors;
 }
@@ -141,10 +152,19 @@ type LayerDef = {
 
 function parseStyle(input: AuditInput): { layers: LayerDef[]; sources: Record<string, unknown> } {
   if (input.style_json) {
-    return {
-      layers: ((input.style_json.layers as LayerDef[]) || []),
-      sources: (input.style_json.sources as Record<string, unknown>) || {},
-    };
+    const rawLayers = input.style_json.layers;
+    // Guard: layers must be an array; each entry must be an object with a string id
+    const layers = Array.isArray(rawLayers)
+      ? rawLayers
+          .filter((l): l is Record<string, unknown> => typeof l === "object" && l !== null)
+          .map((l) => ({ id: "", ...l } as LayerDef))
+      : [];
+    const rawSources = input.style_json.sources;
+    const sources =
+      typeof rawSources === "object" && rawSources !== null && !Array.isArray(rawSources)
+        ? (rawSources as Record<string, unknown>)
+        : {};
+    return { layers, sources };
   }
   return { layers: [], sources: {} };
 }
@@ -160,7 +180,7 @@ export function handleDesignAudit(input: AuditInput): {
   // ── Hierarchy ──────────────────────────────────────────────────────────────
 
   const routeIdx = layers.findIndex(
-    (l) => l.id.includes("route") || (l.type === "line" && ((l.paint?.["line-width"] as number) ?? 0) > 2)
+    (l) => (l.id ?? "").includes("route") || (l.type === "line" && ((l.paint?.["line-width"] as number) ?? 0) > 2)
   );
   const poiIdxLast = [...layers].reverse().findIndex((l) => l.type === "symbol");
   const poiIdx = poiIdxLast >= 0 ? layers.length - 1 - poiIdxLast : -1;
@@ -181,7 +201,7 @@ export function handleDesignAudit(input: AuditInput): {
     violations.push({
       id: "data-above-basemap",
       severity: "error",
-      message: `Custom layers [${unslotted.map((l) => l.id).join(", ")}] lack explicit slot assignment.`,
+      message: `Custom layers [${unslotted.map((l) => l.id || "(unnamed)").join(", ")}] lack explicit slot assignment.`,
       fix: "Add slot:'top' or slot:'middle' to custom data layers.",
     });
   }
@@ -279,7 +299,7 @@ export function handleDesignAudit(input: AuditInput): {
           id: "wcag-text",
           severity: worstRatio < 2.0 ? "error" : worstRatio < 3.5 ? "warn" : "info",
           message: `Custom text color overrides [${failingOverrides.map((e) => e.key).join(", ")}] may fail WCAG AA at ${preset} lightPreset.`,
-          fix: "Use DevKit check_color_contrast to validate rendered colors, then adjust lightness.",
+          fix: "Run design_audit again after adjusting text color lightness to verify contrast.",
         });
       }
     }
@@ -386,10 +406,13 @@ export function handleDesignAudit(input: AuditInput): {
 
   // ── Performance ────────────────────────────────────────────────────────────
 
-  const largeSources = Object.entries(sources).filter(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ([, src]: any) => src.type === "geojson" && src.data?.features?.length > 500
-  ).map(([id]) => id);
+  const largeSources = Object.entries(sources).filter(([, src]) => {
+    if (typeof src !== "object" || src === null) return false;
+    const s = src as Record<string, unknown>;
+    if (s.type !== "geojson") return false;
+    const data = s.data as Record<string, unknown> | undefined;
+    return Array.isArray(data?.features) && (data!.features as unknown[]).length > 500;
+  }).map(([id]) => id);
   if (largeSources.length > 0) {
     violations.push({
       id: "geojson-too-large",
@@ -411,13 +434,13 @@ export function handleDesignAudit(input: AuditInput): {
     });
   }
 
-  const unclusteredSources = Object.entries(sources).filter(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    ([, src]: any) =>
-      src.type === "geojson" &&
-      src.data?.features?.length > 100 &&
-      !src.cluster
-  ).map(([id]) => id);
+  const unclusteredSources = Object.entries(sources).filter(([, src]) => {
+    if (typeof src !== "object" || src === null) return false;
+    const s = src as Record<string, unknown>;
+    if (s.type !== "geojson" || s.cluster) return false;
+    const data = s.data as Record<string, unknown> | undefined;
+    return Array.isArray(data?.features) && (data!.features as unknown[]).length > 100;
+  }).map(([id]) => id);
   if (unclusteredSources.length > 0) {
     violations.push({
       id: "no-clustering",
@@ -460,7 +483,6 @@ interface PaletteSuggestInput {
   brand_color: string;
   segment: string;
   background: "light" | "dark";
-  n_accent_colors?: number;
 }
 
 function hslToHex(h: number, s: number, l: number): string {
@@ -574,7 +596,7 @@ interface SegmentPresetInput {
 
 type StandardConfig = Record<string, unknown>;
 
-const PRESETS: Record<string, StandardConfig> = {
+export const PRESETS: Record<string, StandardConfig> = {
   logistics_customer: { lightPreset: "day", theme: "faded", showPointOfInterestLabels: false, showLandmarkIcons: false, show3dBuildings: false, colorWater: "#b8d4e8" },
   logistics_driver:   { lightPreset: "day", theme: "default", showPointOfInterestLabels: false, show3dBuildings: true, showLandmarkIcons: false },
   logistics_ops:      { lightPreset: "day", theme: "monochrome", showPointOfInterestLabels: false, showLandmarkIcons: false, show3dBuildings: false },
@@ -603,7 +625,7 @@ const PRESET_INSTRUCTIONS: Record<string, string[]> = {
     "Show lane geometry layers at minzoom:17",
   ],
   outdoors: [
-    "Paths and cycleways need visual prominence over car roads — requires Classic mode or a custom line layer",
+    "Paths and cycleways need visual prominence over car roads — use a custom line layer on top of Standard",
     "Add a custom line layer for cycling routes: yellow highlight at z13+, car roads in grey",
     "Filter commercial POIs: show only campsites, trailheads, water sources (minzoom:12)",
     "GPS trace layer: line-width expression ['interpolate',['linear'],['zoom'],10,1,16,4]",
@@ -647,7 +669,7 @@ const PRESET_INSTRUCTIONS: Record<string, string[]> = {
     "Hazard/alert data must use slot:'top' with high-contrast fills (opacity 0.6-0.8)",
     "ALL text must pass WCAG AA (4.5:1 minimum)",
     "Build Static Images API fallback — emergency maps must survive 100x normal traffic spikes",
-    "Use Light or Standard faded theme — no experimental GL JS features in production emergency maps",
+    "Use Standard faded theme — no experimental GL JS features in production emergency maps (Classic light-v11 only as last resort)",
   ],
 };
 
@@ -671,7 +693,7 @@ const RATIONALE: Record<string, string> = {
   public_sector:      "Light/faded theme — trust and accessibility over aesthetics. No 3D or dark themes during emergencies.",
 };
 
-const SEGMENT_PREVIEW_CENTERS: Record<string, { lng: number; lat: number; zoom: number }> = {
+export const SEGMENT_PREVIEW_CENTERS: Record<string, { lng: number; lat: number; zoom: number }> = {
   logistics_customer:  { lng: -73.99, lat: 40.73, zoom: 13 },
   logistics_driver:    { lng: -73.99, lat: 40.73, zoom: 17 },
   logistics_ops:       { lng: -87.63, lat: 41.88, zoom: 10 },
@@ -737,83 +759,3 @@ export function handleSegmentPreset(input: SegmentPresetInput): {
   return result;
 }
 
-// ── Tool: wcag_validate ───────────────────────────────────────────────────────
-
-interface WcagValidateInput {
-  style_json?: Record<string, unknown>;
-  standard_config?: Record<string, unknown>;
-  level?: "AA" | "AAA";
-  only_failures?: boolean;
-}
-
-export function handleWcagValidate(input: WcagValidateInput): {
-  pairs: Array<{
-    layer_id: string;
-    text_color: string;
-    background_color: string;
-    ratio: number;
-    required: number;
-    passes: boolean;
-    fix: string;
-  }>;
-  all_pass: boolean;
-  summary: string;
-} {
-  const aaTarget = input.level === "AAA" ? 7.0 : 4.5;
-  const pairs: ReturnType<typeof handleWcagValidate>["pairs"] = [];
-
-  if (input.standard_config && !input.style_json) {
-    const preset = (input.standard_config.lightPreset as string) || "day";
-    const bg = EFFECTIVE_BG[preset] ?? EFFECTIVE_BG.day;
-    const colorKeys = ["colorPlaceLabels", "colorPointOfInterestLabels", "colorRoadLabels"];
-    for (const key of colorKeys) {
-      const color = input.standard_config[key] as string;
-      if (!color || !color.startsWith("#")) continue;
-      const ratio = wcagRatio(color, bg);
-      const required = key === "colorRoadLabels" ? 3.0 : aaTarget;
-      const passes = ratio >= required;
-      pairs.push({
-        layer_id: key,
-        text_color: color,
-        background_color: bg,
-        ratio: Math.round(ratio * 100) / 100,
-        required,
-        passes,
-        fix: passes
-          ? "Passes"
-          : `Adjust ${key} lightness — need ${required}:1 against ${preset} background (${bg}).`,
-      });
-    }
-  } else if (input.style_json) {
-    const layers = (input.style_json.layers as LayerDef[]) || [];
-    for (const layer of layers) {
-      if (layer.type !== "symbol") continue;
-      const tc = layer.paint?.["text-color"] as string;
-      const hc = (layer.paint?.["text-halo-color"] as string) || "#ffffff";
-      if (!tc || !tc.startsWith("#")) continue;
-      const ratio = wcagRatio(tc, hc);
-      const required = aaTarget;
-      const passes = ratio >= required;
-      pairs.push({
-        layer_id: layer.id,
-        text_color: tc,
-        background_color: hc,
-        ratio: Math.round(ratio * 100) / 100,
-        required,
-        passes,
-        fix: passes
-          ? "Passes"
-          : `Increase contrast between ${tc} and halo ${hc} to ≥${required}:1.`,
-      });
-    }
-  }
-
-  const all_pass = pairs.every((p) => p.passes);
-  const fails = pairs.filter((p) => !p.passes).length;
-  const summary = all_pass
-    ? `All ${pairs.length} color pair(s) pass WCAG ${input.level ?? "AA"}.`
-    : `${fails} of ${pairs.length} pair(s) fail WCAG ${input.level ?? "AA"} — see fix suggestions above.`;
-
-  const filteredPairs = (input.only_failures ?? true) ? pairs.filter((p) => !p.passes) : pairs;
-  return { pairs: filteredPairs, all_pass, summary };
-}

@@ -12,19 +12,17 @@
 import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import {
-  handleCheckColorContrast,
   handleDesignAudit,
   handleGetDesignGuidance,
   handlePaletteSuggest,
   handleSegmentPreset,
-  handleWcagValidate,
   PRESETS,
   SEGMENT_PREVIEW_CENTERS,
 } from "./tools";
 import { SEGMENT_GUIDANCE, SEGMENT_KEYS, TOPIC_GUIDANCE, TOPIC_KEYS } from "./design-guidance";
 import { DEV_PATTERNS, EXAMPLE_URLS, RELATED_PATTERNS, SEGMENT_NOTES } from "./dev-patterns";
 import { validateExpression, getReference } from "./expression-validator";
-import { screenshotMap } from "./gl-map-renderer";
+import { screenshotMap, STYLE_RE } from "./gl-map-renderer";
 import { type ClientMode, modeBriefText } from "./mode-brief";
 import { project, projectCoords, type Viewport } from "./projection";
 
@@ -81,7 +79,78 @@ function getRequestMode(c: Context<{ Bindings: Env }>): ClientMode {
   return "make";
 }
 
+// ── Token encryption helpers (AES-GCM via WebCrypto) ─────────────────────────
+//
+// Secret Mapbox tokens (sk.*) are encrypted at rest in KV using AES-256-GCM.
+// The encryption key is derived from the ENCRYPTION_KEY Worker secret (hex string).
+// If ENCRYPTION_KEY is not set, tokens are stored plaintext with a console warning.
+// Stored format (base64): <12-byte IV><ciphertext>
+
+type EnvWithKey = Env & { ENCRYPTION_KEY?: string };
+
+async function deriveKey(hexSecret: string): Promise<CryptoKey> {
+  const keyBytes = new Uint8Array(hexSecret.match(/.{2}/g)!.map((h) => parseInt(h, 16)));
+  return crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+async function encryptToken(token: string, env: EnvWithKey): Promise<string> {
+  const secret = (env as unknown as Record<string, string>).ENCRYPTION_KEY;
+  if (!secret) return token; // fallback: plaintext (warn at startup ideally)
+  const key = await deriveKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    new TextEncoder().encode(token),
+  );
+  const combined = new Uint8Array(12 + encrypted.byteLength);
+  combined.set(iv, 0);
+  combined.set(new Uint8Array(encrypted), 12);
+  // Mark encrypted values with prefix "enc:" so we can detect plaintext fallbacks
+  return "enc:" + btoa(String.fromCharCode(...combined));
+}
+
+async function decryptToken(stored: string, env: EnvWithKey): Promise<string> {
+  if (!stored.startsWith("enc:")) return stored; // plaintext fallback
+  const secret = (env as unknown as Record<string, string>).ENCRYPTION_KEY;
+  if (!secret) return stored.slice(4); // no key — return raw (shouldn't happen)
+  const key = await deriveKey(secret);
+  const combined = new Uint8Array(
+    atob(stored.slice(4)).split("").map((c) => c.charCodeAt(0)),
+  );
+  const iv = combined.slice(0, 12);
+  const ciphertext = combined.slice(12);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+  return new TextDecoder().decode(plain);
+}
+
 // ── Auth helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Allowlist for OAuth redirect_uri values.
+ *
+ * Rules (in order):
+ *  1. https:// — secure transport to any host; safe against network sniffing.
+ *  2. http://localhost or http://127.0.0.1 — CLI tools (e.g. Claude Code) open a
+ *     local loopback server to receive the code; the port is dynamic so we allow
+ *     any port but restrict to loopback hostnames only.
+ *  3. claude:// and vscode:// — registered app-scheme deep links for desktop MCP clients.
+ *
+ * Plain http:// to any non-loopback host is blocked to prevent an attacker from
+ * registering an arbitrary redirect target to intercept the authorization code
+ * (and thereby steal the user's sk.* Mapbox secret token).
+ */
+function isAllowedRedirectUri(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "https:") return true;
+    if (u.protocol === "claude:" || u.protocol === "vscode:") return true;
+    if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
 
 function getUserNameFromToken(token: string): string {
   const parts = token.split(".");
@@ -96,9 +165,11 @@ function getUserNameFromToken(token: string): string {
 async function getMapboxToken(authHeader: string | undefined, env: Env): Promise<string | null> {
   const bearer = authHeader?.replace(/^Bearer\s+/i, "").trim();
   if (!bearer || bearer === "public") {
-    return env.SESSIONS ? null : (env.MAPBOX_TOKEN ?? null);
+    return null; // MAPBOX_TOKEN env fallback removed — always use KV sessions
   }
-  return env.SESSIONS.get(`session:${bearer}`);
+  const stored = await env.SESSIONS.get(`session:${bearer}`);
+  if (!stored) return null;
+  return decryptToken(stored, env as EnvWithKey);
 }
 
 async function getPublicToken(authHeader: string | undefined, env: Env): Promise<string | null> {
@@ -124,6 +195,9 @@ async function geocodeOne(query: string, token: string): Promise<[number, number
   return feature.center;
 }
 
+// Shared constants used by both the internal helpers and executeTool validation.
+const ALLOWED_PROFILES = new Set(["driving", "driving-traffic", "walking", "cycling"]);
+
 // ── Reusable Mapbox REST fetch helpers ────────────────────────────────────────
 
 async function fetchDirectionsGeometry(
@@ -131,6 +205,7 @@ async function fetchDirectionsGeometry(
   profile: string,
   token: string,
 ): Promise<{ coordinates: [number, number][]; distance: number; duration: number }> {
+  if (!ALLOWED_PROFILES.has(profile)) profile = "driving"; // clamp to safe default for internal helper
   const coords = await Promise.all(waypoints.map((wp) => geocodeOne(wp, token)));
   const coordStr = coords.map(([lng, lat]) => `${lng},${lat}`).join(";");
   const res = await fetch(
@@ -155,6 +230,7 @@ async function fetchIsochronePolygons(
   profile: string,
   token: string,
 ): Promise<IsochroneFeature[]> {
+  if (!ALLOWED_PROFILES.has(profile)) profile = "driving"; // clamp to safe default for internal helper
   const [lng, lat] = await geocodeOne(location, token);
   const params = new URLSearchParams({
     access_token: token,
@@ -239,6 +315,30 @@ function consentPageHtml(nonce: string, error?: string): string {
 
 type Env = { SESSIONS: KVNamespace; MAPBOX_TOKEN?: string; BROWSER: Fetcher };
 
+// ── Rate limiting helpers ─────────────────────────────────────────────────────
+
+const RATE_LIMIT_TOOL_CALLS = 120;   // max tool calls per session per minute
+const RATE_LIMIT_TOKEN_REQS = 10;    // max /oauth/token attempts per IP per minute
+
+/**
+ * Fixed-window KV counter. Returns true if the request is within limits.
+ * Increments the counter atomically-ish (KV is eventually consistent; this is
+ * a best-effort throttle, not a hard guarantee).
+ */
+async function checkRateLimit(
+  kv: KVNamespace,
+  key: string,
+  maxPerWindow: number,
+  windowSeconds = 60,
+): Promise<boolean> {
+  const raw = await kv.get(`rl:${key}`);
+  const count = raw ? parseInt(raw, 10) : 0;
+  if (count >= maxPerWindow) return false;
+  // Best-effort increment — fire-and-forget so it doesn't add latency
+  void kv.put(`rl:${key}`, String(count + 1), { expirationTtl: windowSeconds });
+  return true;
+}
+
 const app = new Hono<{ Bindings: Env }>();
 app.use("/*", cors({
   origin: "*",
@@ -305,13 +405,16 @@ app.get("/authorize", async (c) => {
   const { redirect_uri, state, code_challenge, code_challenge_method } = c.req.query();
   if (!redirect_uri)
     return c.json({ error: "invalid_request", error_description: "missing redirect_uri" }, 400);
-  try {
-    const scheme = new URL(redirect_uri).protocol;
-    if (!["https:", "http:", "claude:", "vscode:"].includes(scheme))
-      return c.json({ error: "invalid_request", error_description: "invalid redirect_uri scheme" }, 400);
-  } catch {
-    return c.json({ error: "invalid_request", error_description: "invalid redirect_uri" }, 400);
-  }
+  if (!isAllowedRedirectUri(redirect_uri))
+    return c.json({
+      error: "invalid_request",
+      error_description:
+        "redirect_uri is not allowed. Accepted: https://<any-host>, " +
+        "http://localhost:<port>/..., http://127.0.0.1:<port>/..., claude://<path>, vscode://<path>.",
+    }, 400);
+  // PKCE (S256) is mandatory — it is the only code-binding mechanism for this public client.
+  if (!code_challenge)
+    return c.json({ error: "invalid_request", error_description: "code_challenge (S256) is required" }, 400);
   if (code_challenge_method && code_challenge_method !== "S256")
     return c.json({ error: "invalid_request", error_description: "only S256 code_challenge_method is supported" }, 400);
 
@@ -372,7 +475,7 @@ app.post("/authorize/submit", async (c) => {
   const sessionCode = crypto.randomUUID();
   await c.env.SESSIONS.put(
     `code:${sessionCode}`,
-    JSON.stringify({ mapboxToken: token, pkToken: pkToken || null, codeChallenge: code_challenge }),
+    JSON.stringify({ mapboxToken: token, pkToken: pkToken || null, codeChallenge: code_challenge, redirectUri: redirect_uri }),
     { expirationTtl: 300 },
   );
   await c.env.SESSIONS.delete(`nonce:${nonce}`);
@@ -386,6 +489,12 @@ app.post("/authorize/submit", async (c) => {
 // ── Token endpoint ──────────────────────────────────────────────────────────
 
 app.post("/oauth/token", async (c) => {
+  // Rate-limit by IP to slow brute-force code guessing
+  const ip = c.req.header("CF-Connecting-IP") ?? c.req.header("X-Forwarded-For") ?? "unknown";
+  if (!(await checkRateLimit(c.env.SESSIONS, `token:${ip}`, RATE_LIMIT_TOKEN_REQS))) {
+    return c.json({ error: "too_many_requests", error_description: "Too many token requests — wait 60 seconds" }, 429);
+  }
+
   const body = await c.req.parseBody();
   const code = (body.code as string | undefined)?.trim();
   const codeVerifier = body.code_verifier as string | undefined;
@@ -395,25 +504,31 @@ app.post("/oauth/token", async (c) => {
   const raw = await c.env.SESSIONS.get(`code:${code}`);
   if (!raw || raw === "used")
     return c.json({ error: "invalid_grant", error_description: "invalid or expired code" }, 400);
-  const { mapboxToken, pkToken, codeChallenge } = JSON.parse(raw) as {
-    mapboxToken: string; pkToken?: string | null; codeChallenge?: string;
+
+  // Mark the code as used immediately to narrow the double-use race window.
+  // KV is eventually consistent and the read-write is non-atomic, so this does
+  // not eliminate the race entirely, but it makes concurrent redemption far less likely.
+  await c.env.SESSIONS.put(`code:${code}`, "used", { expirationTtl: 60 });
+
+  const { mapboxToken, pkToken, codeChallenge, redirectUri } = JSON.parse(raw) as {
+    mapboxToken: string; pkToken?: string | null; codeChallenge: string; redirectUri?: string;
   };
 
-  // PKCE validation (S256)
-  if (codeChallenge) {
-    if (!codeVerifier)
-      return c.json({ error: "invalid_request", error_description: "code_verifier required" }, 400);
-    const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
-    const b64 = btoa(String.fromCharCode(...new Uint8Array(hash)))
-      .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-    if (b64 !== codeChallenge)
-      return c.json({ error: "invalid_grant", error_description: "code_verifier mismatch" }, 400);
-  }
+  // PKCE validation (S256) — mandatory; /authorize always issues a challenge.
+  if (!codeVerifier)
+    return c.json({ error: "invalid_request", error_description: "code_verifier required" }, 400);
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(codeVerifier));
+  const b64 = btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  if (b64 !== codeChallenge)
+    return c.json({ error: "invalid_grant", error_description: "code_verifier mismatch" }, 400);
 
-  // Sentinel prevents double-use (KV is not atomic)
-  await c.env.SESSIONS.put(`code:${code}`, "used", { expirationTtl: 60 });
+  // redirect_uri binding — the client must echo the same URI used at /authorize (T4-16).
+  const incomingRedirectUri = (body.redirect_uri as string | undefined)?.trim();
+  if (redirectUri && incomingRedirectUri && incomingRedirectUri !== redirectUri)
+    return c.json({ error: "invalid_grant", error_description: "redirect_uri mismatch" }, 400);
   const sessionId = crypto.randomUUID();
-  await c.env.SESSIONS.put(`session:${sessionId}`, mapboxToken, { expirationTtl: 2592000 });
+  await c.env.SESSIONS.put(`session:${sessionId}`, await encryptToken(mapboxToken, c.env as EnvWithKey), { expirationTtl: 2592000 });
   if (pkToken) {
     await c.env.SESSIONS.put(`session:${sessionId}:pk`, pkToken, { expirationTtl: 2592000 });
   }
@@ -424,9 +539,51 @@ app.post("/oauth/token", async (c) => {
 // Legacy /token alias for older MCP clients
 app.post("/token", (c) => c.redirect("/oauth/token", 307));
 
+// ── Session revoke (sign-out) ───────────────────────────────────────────────
+// POST /session/revoke with the current Bearer token to delete the session from KV.
+// This is the only way to revoke access without waiting for the 30-day TTL to expire.
+app.post("/session/revoke", async (c) => {
+  const authHeader = c.req.header("Authorization");
+  const bearer = authHeader?.replace(/^Bearer\s+/i, "").trim();
+  if (!bearer || bearer === "public")
+    return c.json({ error: "invalid_request", error_description: "No active session to revoke" }, 400);
+  await Promise.all([
+    c.env.SESSIONS.delete(`session:${bearer}`),
+    c.env.SESSIONS.delete(`session:${bearer}:pk`),
+  ]);
+  return c.json({ revoked: true });
+});
+
+// ── Hosted image serving ────────────────────────────────────────────────────
+// WebGL-rendered map images are stored in KV under an `img:` prefix with a 1-hour TTL.
+// The agent curls this URL, saves to /tmp/, and uploads to Figma via upload_assets.
+// Accepting both `/img/<uuid>` and `/img/<uuid>.png` so consumers that sniff by extension
+// get the right codec. The KV key never includes the extension.
+
+app.get("/img/:key", async (c) => {
+  const raw = c.req.param("key");
+  const id = raw.replace(/\.(png|jpe?g)$/i, "");
+  try {
+    const { value, metadata } = await c.env.SESSIONS.getWithMetadata<{ mimeType: string }>(
+      `img:${id}`,
+      { type: "arrayBuffer" },
+    );
+    if (!value) return c.json({ error: "not_found", error_description: "Image not found or expired" }, 404);
+    const mimeType = metadata?.mimeType ?? "image/png";
+    return c.body(value as ArrayBuffer, 200, {
+      "Content-Type": mimeType,
+      "Cache-Control": "public, max-age=3600",
+      "Access-Control-Allow-Origin": "*",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return c.json({ error: "server_error", error_description: msg }, 500);
+  }
+});
+
 // ── MCP tool discovery ──────────────────────────────────────────────────────
 
-const MCP_SERVER_INFO = { name: "map-design-mcp", version: "2.0.0" };
+const MCP_SERVER_INFO = { name: "map-design-mcp", version: "2.1.0" };
 
 const MCP_TOOLS = [
       // ── Pattern library (no token required) ───────────────────────────
@@ -552,22 +709,6 @@ const MCP_TOOLS = [
           required: ["segment"],
         },
       },
-      {
-        name: "wcag_validate",
-        description: "Validate text/background color pairs in a Mapbox style against WCAG 2.1 AA.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            style_json: { type: "object" },
-            standard_config: { type: "object" },
-            level: { type: "string", enum: ["AA", "AAA"] },
-            only_failures: {
-              type: "boolean",
-              description: "Return only failing pairs (default true). Set false to include passing pairs.",
-            },
-          },
-        },
-      },
       // ── Mapbox MCP proxy ───────────────────────────────────────────────
       {
         name: "geocode",
@@ -625,7 +766,8 @@ const MCP_TOOLS = [
       {
         name: "static_map",
         description:
-          "Render and return a map as an image (MCP image content — embedded directly, no URL needed). " +
+          "Render and return a map as an image. Returns a fetchable PNG URL in a text block. " +
+          "To place in Figma: curl the URL to get bytes, upload via upload_assets, then set as image fill. " +
           "Available in both Figma Design (static deliverable) and Figma Make (quick preview during iteration). " +
           "Default renderer is 'webgl' (Mapbox GL JS in headless Chrome) using mapbox/standard — supports 3D buildings, " +
           "lightPreset, landmark icons, pitch/bearing, and all Standard config (~5-10s). " +
@@ -638,12 +780,10 @@ const MCP_TOOLS = [
           properties: {
             center: { type: "array", items: { type: "number" }, description: "[lng, lat] — optional if segment= is provided" },
             zoom: { type: "number", description: "Zoom level — optional if segment= is provided" },
-            width: { type: "number", description: "Image width in pixels (default 600)" },
-            height: { type: "number", description: "Image height in pixels (default 400)" },
             bearing: { type: "number", description: "Camera rotation in degrees 0–360 (default 0 = north-up)" },
             pitch: { type: "number", description: "Camera tilt in degrees 0–60 (default 0 = top-down; 45–60 = dramatic 3D perspective)" },
-            retina: { type: "boolean", description: "Return @2x high-DPI image (default false)" },
-            style: { type: "string", description: "Mapbox style. Defaults to 'mapbox/standard' (recommended — rendered via webgl). Pass a Classic style ONLY if you specifically need the fast Static Images API path or the user explicitly requests it: 'mapbox/streets-v12', 'mapbox/light-v11', 'mapbox/dark-v11', 'mapbox/outdoors-v12', 'mapbox/satellite-v9', 'mapbox/satellite-streets-v12'. Or a custom 'username/styleId'. Classic styles render via the Static Images API; mapbox/standard renders via webgl." },
+            retina: { type: "boolean", description: "Return @2x high-DPI image (default true)" },
+            style: { type: "string", description: "Mapbox style to render. Defaults to 'mapbox/standard'. WebGL styles (support 3D + Standard config): 'mapbox/standard' — 3D buildings & landmarks, dynamic lighting (lightPreset day/dusk/dawn/night), themes, full Standard config (default, recommended); 'mapbox/standard-satellite' — satellite imagery base + 3D + place/road labels. Classic styles (fast Static Images API, 2D only): 'mapbox/streets-v12' — detailed street map, full labels/POIs; 'mapbox/light-v11' — minimal light/neutral backdrop, ideal for data overlays & choropleths; 'mapbox/dark-v11' — minimal dark backdrop for data viz & dark-mode UIs; 'mapbox/outdoors-v12' — terrain shading, contour lines, trails for hiking/outdoor; 'mapbox/satellite-v9' — pure satellite imagery, NO labels; 'mapbox/satellite-streets-v12' — satellite imagery + street & place labels. Or a custom 'username/styleId'." },
             segment: {
               type: "string",
               enum: SEGMENT_KEYS,
@@ -668,20 +808,19 @@ const MCP_TOOLS = [
           "to exact {x,y} pixel coordinates relative to that image, so Figma can place them as real, editable vector layers " +
           "on top of the map. Camera is always explicit (center + zoom required). " +
           "Routes and isochrones are fetched server-side — no interactive code needed. " +
-          "Returns: _image (embedded image), viewport (the camera transform), and overlays.{markers,routes,isochrones} " +
-          "each with pixel {x,y,in_view} per point. " +
-          "Note: returned {x,y} coords are in logical (non-retina) pixels — if retina=true the image bytes are 2×, " +
-          "but Figma should size the image frame to width×height and use the logical pixel coords.",
+          "Returns TWO text blocks: " +
+          "(1) Fetchable PNG URL — curl to get bytes, upload via upload_assets, set as image fill. " +
+          "(2) JSON with { viewport, overlays: { markers, routes, isochrones } }, each with pixel {x,y,in_view} per point. " +
+          "Note: {x,y} coords are logical (non-retina) pixels — if retina=true the image bytes are 2×, " +
+          "but size the Figma frame to width×height and use the logical pixel coords.",
         inputSchema: {
           type: "object",
           properties: {
             center: { type: "array", items: { type: "number" }, description: "[lng, lat] of the map center (required)" },
             zoom: { type: "number", description: "Zoom level (required)" },
-            width: { type: "number", description: "Image width in logical pixels (default 600)" },
-            height: { type: "number", description: "Image height in logical pixels (default 400)" },
             bearing: { type: "number", description: "Map rotation in degrees 0–360 (default 0 = north-up)" },
-            retina: { type: "boolean", description: "Return @2x high-DPI image bytes (default false). Pixel coords are still in logical px." },
-            style: { type: "string", description: "Mapbox style — defaults to 'mapbox/standard'. Classic styles use the fast Static Images API." },
+            retina: { type: "boolean", description: "Return @2x high-DPI image bytes (default true). Pixel coords are still in logical px." },
+            style: { type: "string", description: "Mapbox style to render. Defaults to 'mapbox/standard'. WebGL styles (support 3D + Standard config): 'mapbox/standard' — 3D buildings & landmarks, dynamic lighting, themes, full Standard config (default); 'mapbox/standard-satellite' — satellite imagery base + 3D + labels. Classic styles (fast Static Images API, 2D only): 'mapbox/streets-v12' — detailed street map; 'mapbox/light-v11' — minimal light backdrop for data overlays; 'mapbox/dark-v11' — minimal dark backdrop; 'mapbox/outdoors-v12' — terrain/trails; 'mapbox/satellite-v9' — pure satellite, no labels; 'mapbox/satellite-streets-v12' — satellite + labels. Or a custom 'username/styleId'." },
             segment: { type: "string", enum: SEGMENT_KEYS, description: "Apply segment-tuned Standard config to the basemap" },
             standard_config: { type: "object", description: "Standard style config overrides (lightPreset, colorLand, show3dBuildings, etc.)" },
             markers: {
@@ -742,100 +881,51 @@ const MCP_TOOLS = [
       },
       // ── Mapbox Styles API (session auth required) ──────────────────────
       {
-        name: "list_styles_tool",
-        description: "List all Mapbox styles for the authenticated account.",
+        name: "manage_style",
+        description:
+          "Create, read, update, or delete Mapbox styles for the authenticated account. " +
+          "action='list' — list all styles (optional limit, start pagination token). " +
+          "action='retrieve' — fetch a style by styleId. " +
+          "action='create' — create a new style (requires name + style spec object). " +
+          "action='update' — PATCH an existing style (requires styleId; provide name and/or style fields to change). " +
+          "action='delete' — permanently delete a style by styleId.",
         inputSchema: {
           type: "object",
           properties: {
-            limit: { type: "number", description: "Max styles to return (recommend 5–10)" },
-            start: { type: "string", description: "Pagination start token from previous response" },
+            action: { type: "string", enum: ["list", "retrieve", "create", "update", "delete"] },
+            styleId: { type: "string", description: "Style ID — required for retrieve, update, delete" },
+            name: { type: "string", description: "Style name — required for create, optional for update" },
+            style: { type: "object", description: "Mapbox Style Spec object — required for create, optional partial for update" },
+            limit: { type: "number", description: "Max styles to return (list only, recommend 5–10)" },
+            start: { type: "string", description: "Pagination start token from previous list response" },
           },
+          required: ["action"],
         },
       },
+      // ── Mapbox Tokens API (session auth required) ──────────────────────
       {
-        name: "retrieve_style_tool",
-        description: "Retrieve a specific Mapbox style by ID.",
-        inputSchema: {
-          type: "object",
-          properties: { styleId: { type: "string", description: "Style ID" } },
-          required: ["styleId"],
-        },
-      },
-      {
-        name: "create_style_tool",
-        description: "Create a new Mapbox style. Provide a name and a complete Mapbox Style Specification object.",
+        name: "manage_tokens",
+        description:
+          "List or create Mapbox public access tokens (pk.*) for the authenticated account. " +
+          "action='list' — list existing tokens (check here before creating to avoid proliferation). " +
+          "action='create' — create a new scoped token (requires note + scopes).",
         inputSchema: {
           type: "object",
           properties: {
-            name: { type: "string", description: "Human-readable style name" },
-            style: { type: "object", description: "Mapbox Style Spec object (version, sources, layers, …)" },
-          },
-          required: ["name", "style"],
-        },
-      },
-      {
-        name: "update_style_tool",
-        description: "Update an existing Mapbox style. PATCH — only provided fields are changed.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            styleId: { type: "string" },
-            name: { type: "string", description: "New name (optional)" },
-            style: { type: "object", description: "Partial or full style spec to merge in (optional)" },
-          },
-          required: ["styleId"],
-        },
-      },
-      {
-        name: "delete_style_tool",
-        description: "Permanently delete a Mapbox style by ID.",
-        inputSchema: {
-          type: "object",
-          properties: { styleId: { type: "string" } },
-          required: ["styleId"],
-        },
-      },
-      {
-        name: "list_tokens_tool",
-        description: "List existing Mapbox public access tokens for the authenticated account. Use this BEFORE create_token_tool to check if a suitable token already exists — avoids token proliferation.",
-        inputSchema: {
-          type: "object",
-          properties: {},
-        },
-      },
-      {
-        name: "create_token_tool",
-        description: "Create a new Mapbox public access token with specified scopes and optional URL/time restrictions.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            note: { type: "string", description: "Description of the token" },
+            action: { type: "string", enum: ["list", "create"] },
+            note: { type: "string", description: "Description of the token — required for create" },
             scopes: {
               type: "array",
               items: { type: "string", enum: ["styles:tiles", "styles:read", "fonts:read", "datasets:read", "vision:read"] },
-              description: "Token scopes",
+              description: "Token scopes — required for create",
             },
-            allowedUrls: { type: "array", items: { type: "string" }, description: "URLs where token is valid (max 100)" },
-            expires: { type: "string", description: "ISO 8601 expiry (max 1h in the future)" },
+            allowedUrls: { type: "array", items: { type: "string" }, description: "URLs where token is valid (max 100, create only)" },
+            expires: { type: "string", description: "ISO 8601 expiry (max 1h in the future, create only)" },
           },
-          required: ["note", "scopes"],
+          required: ["action"],
         },
       },
       // ── DevKit MCP proxy ───────────────────────────────────────────────
-      {
-        name: "check_color_contrast",
-        description: "Check WCAG contrast ratio between two colors and report AA/AAA pass/fail.",
-        inputSchema: {
-          type: "object",
-          properties: {
-            foreground: { type: "string", description: "Foreground color (hex, e.g. #333333)" },
-            background: { type: "string", description: "Background color (hex, e.g. #ffffff)" },
-            level: { type: "string", enum: ["AA", "AAA"], description: "WCAG level to test (default AA)" },
-            fontSize: { type: "string", enum: ["normal", "large"], description: "Text size — large = 18pt+/14pt bold (default normal)" },
-          },
-          required: ["foreground", "background"],
-        },
-      },
       {
         name: "validate_expression",
         description: "⚠️ Figma Make only. Validate a Mapbox GL filter or paint expression — a GL JS dev helper for interactive maps.",
@@ -927,54 +1017,33 @@ const MCP_PROMPTS = [
   },
 ];
 
-const CARTOGRAPHY_PRIMER = `CARTOGRAPHY RULES — apply to every map style decision:
+const CARTOGRAPHY_PRIMER = `CARTOGRAPHY RULES:
 
-DECIDE WHAT KIND OF MAP FIRST:
-  User needs to FIND a location / navigate     → Reference/navigation map
-  User needs to UNDERSTAND a pattern in data   → Thematic map
-  User needs to LOCATE branded points          → Business locator (brand markers foreground, basemap recedes)
-  User needs to TELL a data story              → Journalistic/expressive map (flat over 3D)
+MAP TYPE:
+  Navigate / find location   → Reference map
+  Understand data patterns   → Thematic map (choropleth for rates; symbols/heatmap for counts/points)
+  Locate branded points      → Business locator (markers foreground, basemap neutral)
+  Tell a data story          → Journalistic/expressive (flat over 3D)
 
-THEMATIC MAP TYPES — pick the right one:
-  Values per area, rate or ratio (%, index)    → CHOROPLETH — sequential or diverging ColorBrewer ramp
-  Raw counts per area                          → NEVER choropleth — normalize to rate, or use proportional symbols
-  Points < ~500, exact locations matter        → Proportional/categorical symbol
-  Points > ~500, density pattern matters       → Heatmap
-  Movement origin→destination                 → Flow map (≤20 flows draw all; >20 filter top N)
+VISUAL HIERARCHY (top → bottom):
+  User content → POI symbols/labels → Road labels → Roads → Buildings → Land/water
 
-VISUAL HIERARCHY — layer order (top = most important):
-  1. User content: routes, active selections
-  2. POI symbols and labels
-  3. Road labels, place names
-  4. Major → minor roads
-  5. Buildings, administrative boundaries
-  6. Land use, water, terrain (background only)
-
-FIGURE-GROUND — the most foundational principle:
-  Map subject must visually SEPARATE from context.
-  Desaturated, light land = background. Saturated, darker data = foreground.
-  If custom data isn't popping: lighten/desaturate the basemap, not the data.
-  On dark themes: data layers need MORE saturation.
+FIGURE-GROUND:
+  Desaturated land = background. Saturated data = foreground.
+  Lighten/desaturate the basemap if data isn't reading — not the data.
 
 COLOR:
-  Land lightness ≥ 90% (light) / ≤ 15% (dark). Never match land to data.
-  Water saturation ≥ 70% — water must read as water at a glance.
-  Route/line: high chroma, ≥ 4.5:1 contrast on basemap (WCAG AA).
-  Always check_color_contrast before applying any text color pair.
+  Land lightness ≥ 90% (light) / ≤ 15% (dark).
+  Route/line contrast ≥ 4.5:1 on basemap (WCAG AA) — design_audit flags failures.
 
-ZOOM STRATEGY:
-  z0–4: capitals, ocean labels only
-  z5–8: major cities, highways, large water
-  z9–11: all highways, neighborhoods, parks
-  z12–15: all streets, POIs (start at z12 not z14), buildings
-  z16+: house numbers, parking, fine amenities
-  Fade features over 1–2 zoom levels — never abrupt cutoffs:
-    opacity: ['interpolate',['linear'],['zoom'], 11, 0, 12, 1]
+ZOOM:
+  z0–4: capitals only · z5–8: cities/highways · z9–11: neighborhoods
+  z12–15: streets/POIs · z16+: house numbers
+  Fade over 1–2 zoom levels: ['interpolate',['linear'],['zoom'], 11, 0, 12, 1]
 
-STANDARD MODE (preferred):
-  Use setConfigProperty("basemap", key, value) — never setStyle() for Standard.
-  colorLand, colorWater, colorRoad, lightPreset, showPlaceLabels, show3dBuildings.
-  For brand overlays: add GeoJSON custom layers on top, keep basemap neutral.`;
+STANDARD STYLE:
+  setConfigProperty("basemap", key, value) — never setStyle() for Standard.
+  Keys: colorLand, colorWater, colorRoad, lightPreset, showPlaceLabels, show3dBuildings.`;
 
 function buildPromptMessages(
   name: string,
@@ -1036,6 +1105,7 @@ function buildPromptMessages(
   throw new Error(`Unknown prompt: "${name}". Available: ${MCP_PROMPTS.map((p) => p.name).join(", ")}`);
 }
 
+
 app.get("/mcp", (c) => {
   const mode = getRequestMode(c);
   return c.json({
@@ -1045,6 +1115,99 @@ app.get("/mcp", (c) => {
     tools: toolsForMode(mode, MCP_TOOLS),
   });
 });
+
+// ── Tool execution helpers ────────────────────────────────────────────────────
+
+/** Validate a Mapbox routing profile string before interpolating it into a URL path. */
+function validateProfile(profile: string): string {
+  if (!ALLOWED_PROFILES.has(profile)) {
+    throw new Error(
+      `Invalid profile "${profile}". Must be one of: ${[...ALLOWED_PROFILES].join(", ")}.`
+    );
+  }
+  return profile;
+}
+
+/** Validate a Mapbox style string before interpolating it into a URL path or HTML. */
+function validateStyle(style: string): string {
+  if (!STYLE_RE.test(style)) {
+    throw new Error(
+      `Invalid style "${style}". Use "owner/styleId" or "mapbox://styles/owner/styleId".`
+    );
+  }
+  return style;
+}
+
+// ── Image hosting helpers ─────────────────────────────────────────────────────
+
+/**
+ * Store a base64-encoded image in KV and return a publicly fetchable URL.
+ * Images expire after 1 hour. Keyed as `img:<uuid>` to avoid collision with sessions.
+ * The URL includes a file extension so consumers that sniff by filename get the right codec.
+ */
+async function hostImage(
+  env: Env,
+  base: string,
+  image: { data: string; mimeType: string },
+): Promise<string> {
+  const id = crypto.randomUUID();
+  const binary = atob(image.data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  await env.SESSIONS.put(`img:${id}`, bytes.buffer, {
+    expirationTtl: 3600,
+    metadata: { mimeType: image.mimeType },
+  });
+  const ext = image.mimeType === "image/png" ? ".png" : ".jpg";
+  return `${base}/img/${id}${ext}`;
+}
+
+// ── MCP response builder ──────────────────────────────────────────────────────
+
+type McpContentBlock = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+/**
+ * Map an `executeTool` result to an MCP content array.
+ *
+ * Contract for image tools:
+ *   - `_image`     → WebGL render (base64). Stored in KV; first block is a fetchable URL
+ *                    the agent can curl: `curl <url> -o /tmp/map.png` then upload via upload_assets.
+ *   - `_image_url` → CDN URL (classic Static Images). First block is the URL string.
+ * When `viewport` / `overlays` are present (static_overlay), a second JSON text block
+ * is appended so Figma can place editable vector layers at the correct pixel positions.
+ *
+ * Exported for unit-testing the synchronous branches (no KV needed when env=null).
+ */
+export async function buildToolContent(
+  result: unknown,
+  env: Env | null,
+  base: string,
+): Promise<McpContentBlock[]> {
+  if (result && typeof result === "object" && "_image" in (result as object)) {
+    const r = result as { _image: { data: string; mimeType: string }; viewport?: unknown; overlays?: unknown; [k: string]: unknown };
+    const url = env ? await hostImage(env, base, r._image) : `${base}/img/<no-env>`;
+    const content: McpContentBlock[] = [
+      { type: "image", data: r._image.data, mimeType: r._image.mimeType },
+      { type: "text", text: url },
+    ];
+    if (r.viewport !== undefined || r.overlays !== undefined) {
+      content.push({ type: "text", text: JSON.stringify({ viewport: r.viewport, overlays: r.overlays }, null, 2) });
+    }
+    return content;
+  }
+
+  if (result && typeof result === "object" && "_image_url" in (result as object)) {
+    const r = result as { _image_url: string; viewport?: unknown; overlays?: unknown; [k: string]: unknown };
+    const content: McpContentBlock[] = [{ type: "text", text: r._image_url }];
+    if (r.viewport !== undefined || r.overlays !== undefined) {
+      content.push({ type: "text", text: JSON.stringify({ viewport: r.viewport, overlays: r.overlays }, null, 2) });
+    }
+    return content;
+  }
+
+  const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  return [{ type: "text", text }];
+}
 
 // ── Tool execution core ───────────────────────────────────────────────────────
 
@@ -1078,8 +1241,6 @@ async function executeTool(
       return handlePaletteSuggest(input as unknown as Parameters<typeof handlePaletteSuggest>[0]);
     case "segment_preset":
       return handleSegmentPreset(input as unknown as Parameters<typeof handleSegmentPreset>[0]);
-    case "wcag_validate":
-      return handleWcagValidate(input as Parameters<typeof handleWcagValidate>[0]);
   }
 
   // ── Auth-required tools ───────────────────────────────────────────────────
@@ -1087,87 +1248,95 @@ async function executeTool(
 
   // Mapbox Styles / Tokens API — called directly, no proxy
   switch (toolName) {
-    case "list_styles_tool": {
+    case "manage_style": {
+      const { action, styleId, name, style, limit, start } = input as {
+        action: string; styleId?: string; name?: string; style?: object;
+        limit?: number; start?: string;
+      };
       const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const qs = new URLSearchParams({ access_token: mapboxToken });
-      if (input.limit) qs.set("limit", String(input.limit));
-      if (input.start) qs.set("start", String(input.start));
-      const res = await fetch(`https://api.mapbox.com/styles/v1/${u}?${qs}`);
-      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
+      if (action === "list") {
+        const qs = new URLSearchParams({ access_token: mapboxToken });
+        if (limit) qs.set("limit", String(limit));
+        if (start) qs.set("start", String(start));
+        const res = await fetch(`https://api.mapbox.com/styles/v1/${u}?${qs}`);
+        if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      if (action === "retrieve") {
+        if (!styleId) throw new Error("manage_style action='retrieve' requires styleId");
+        const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`);
+        if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      if (action === "create") {
+        if (!name || !style) throw new Error("manage_style action='create' requires name and style");
+        const res = await fetch(`https://api.mapbox.com/styles/v1/${u}?access_token=${mapboxToken}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...style, name }),
+        });
+        if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      if (action === "update") {
+        if (!styleId) throw new Error("manage_style action='update' requires styleId");
+        const styleUrl = `https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`;
+        // Styles API PATCH requires the full style object — GET current first, then merge
+        const getRes = await fetch(styleUrl);
+        if (!getRes.ok) throw new Error(`Mapbox Styles API error ${getRes.status}: ${await getRes.text().catch(() => getRes.statusText)}`);
+        const current = await getRes.json() as Record<string, unknown>;
+        const payload: Record<string, unknown> = { ...current };
+        if (name) payload.name = name;
+        if (style) Object.assign(payload, style);
+        const res = await fetch(styleUrl, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      if (action === "delete") {
+        if (!styleId) throw new Error("manage_style action='delete' requires styleId");
+        const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`, { method: "DELETE" });
+        if (res.status === 204) return { deleted: true };
+        if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      throw new Error(`manage_style: unknown action "${action}". Use list | retrieve | create | update | delete`);
     }
-    case "retrieve_style_tool": {
-      const { styleId } = input as { styleId: string };
-      const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`);
-      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
-    }
-    case "create_style_tool": {
-      const { name, style } = input as { name: string; style: object };
-      const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const res = await fetch(`https://api.mapbox.com/styles/v1/${u}?access_token=${mapboxToken}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ...style, name }),
-      });
-      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
-    }
-    case "update_style_tool": {
-      const { styleId, name, style } = input as { styleId: string; name?: string; style?: object };
-      const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const styleUrl = `https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`;
-      // Styles API PATCH requires the full style object — GET current first, then merge
-      const getRes = await fetch(styleUrl);
-      if (!getRes.ok) throw new Error(`Mapbox Styles API error ${getRes.status}: ${await getRes.text().catch(() => getRes.statusText)}`);
-      const current = await getRes.json() as Record<string, unknown>;
-      const payload: Record<string, unknown> = { ...current };
-      if (name) payload.name = name;
-      if (style) Object.assign(payload, style);
-      const res = await fetch(styleUrl, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) throw new Error(`Mapbox Styles API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
-    }
-    case "delete_style_tool": {
-      const { styleId } = input as { styleId: string };
-      const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const res = await fetch(`https://api.mapbox.com/styles/v1/${u}/${encodeURIComponent(styleId)}?access_token=${mapboxToken}`, { method: "DELETE" });
-      return res.status === 204 ? { deleted: true } : res.json();
-    }
-    case "list_tokens_tool": {
+    case "manage_tokens": {
+      const { action, note, scopes, allowedUrls, expires } = input as {
+        action: string; note?: string; scopes?: string[]; allowedUrls?: string[]; expires?: string;
+      };
       if (mapboxToken.startsWith("pk.")) {
-        return { error: "A secret token (sk.*) with tokens:read scope is required to list tokens. Public tokens (pk.*) cannot access the Tokens API. Create a secret token at account.mapbox.com and reconnect the MCP server with it." };
+        throw new Error("A secret token (sk.*) is required to manage tokens. Public tokens (pk.*) cannot access the Tokens API. Create a secret token at account.mapbox.com and reconnect the MCP server with it.");
       }
       const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const qs = new URLSearchParams({ access_token: mapboxToken });
-      const res = await fetch(`https://api.mapbox.com/tokens/v2/${u}?${qs}`);
-      if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
-    }
-    case "create_token_tool": {
-      if (mapboxToken.startsWith("pk.")) {
-        return { error: "A secret token (sk.*) with tokens:write scope is required to create tokens. Public tokens (pk.*) cannot access the Tokens API. Create a secret token at account.mapbox.com and reconnect the MCP server with it." };
+      if (action === "list") {
+        const qs = new URLSearchParams({ access_token: mapboxToken });
+        const res = await fetch(`https://api.mapbox.com/tokens/v2/${u}?${qs}`);
+        if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
       }
-      const { note, scopes, allowedUrls, expires } = input as { note: string; scopes: string[]; allowedUrls?: string[]; expires?: string };
-      const u = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const payload: Record<string, unknown> = { note, scopes };
-      if (allowedUrls) payload.allowedUrls = allowedUrls;
-      if (expires) payload.expires = expires;
-      const res = await fetch(`https://api.mapbox.com/tokens/v2/${u}?access_token=${mapboxToken}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
-      return res.json();
+      if (action === "create") {
+        if (!note || !scopes) throw new Error("manage_tokens action='create' requires note and scopes");
+        const payload: Record<string, unknown> = { note, scopes };
+        if (allowedUrls) payload.allowedUrls = allowedUrls;
+        if (expires) payload.expires = expires;
+        const res = await fetch(`https://api.mapbox.com/tokens/v2/${u}?access_token=${mapboxToken}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(`Mapbox Tokens API error ${res.status}: ${await res.text().catch(() => res.statusText)}`);
+        return res.json();
+      }
+      throw new Error(`manage_tokens: unknown action "${action}". Use list | create`);
     }
     case "directions": {
       const { waypoints, profile = "driving" } = input as { waypoints: string[]; profile?: string };
+      validateProfile(profile);
       // Use full steps=true response for the interactive tool (richer than the helper's overview-only fetch)
       const coords = await Promise.all((waypoints as string[]).map((wp) => geocodeOne(wp, mapboxToken)));
       const coordStr = coords.map(([lng, lat]) => `${lng},${lat}`).join(";");
@@ -1227,6 +1396,7 @@ async function executeTool(
         contours_minutes: number[];
         profile?: string;
       };
+      validateProfile(profile);
       const [lng, lat] = await geocodeOne(location, mapboxToken);
       const params = new URLSearchParams({
         access_token: mapboxToken,
@@ -1246,6 +1416,7 @@ async function executeTool(
         destinations: string[];
         profile?: string;
       };
+      validateProfile(profile);
       const originCoords = await Promise.all((origins as string[]).map((o) => geocodeOne(o, mapboxToken)));
       const destCoords = await Promise.all((destinations as string[]).map((d) => geocodeOne(d, mapboxToken)));
       const allCoords = [...originCoords, ...destCoords];
@@ -1266,12 +1437,12 @@ async function executeTool(
     }
 
     case "static_map": {
+      const width = 600;
+      const height = 400;
       const {
-        width = 600,
-        height = 400,
         bearing = 0,
         pitch = 0,
-        retina = false,
+        retina = true,
         style,
         segment,
         standard_config,
@@ -1279,8 +1450,6 @@ async function executeTool(
       } = input as {
         center?: [number, number];
         zoom?: number;
-        width?: number;
-        height?: number;
         bearing?: number;
         pitch?: number;
         retina?: boolean;
@@ -1316,9 +1485,9 @@ async function executeTool(
       if (segment && PRESETS[segment]) Object.assign(configEntries, PRESETS[segment]);
       if (standard_config && typeof standard_config === "object") Object.assign(configEntries, standard_config);
 
-      // Style resolution
+      // Style resolution + validation
       const hasStandardConfig = Object.keys(configEntries).length > 0;
-      const resolvedStyle = style ?? "mapbox/standard";
+      const resolvedStyle = validateStyle(style ?? "mapbox/standard");
 
       // ── Renderer routing ──────────────────────────────────────────────────────
       // WebGL (Cloudflare Browser Rendering): supports mapbox/standard, 3D, all Standard config
@@ -1329,7 +1498,7 @@ async function executeTool(
 
       if (useWebGL) {
         const imageData = await screenshotMap(
-          { center, zoom, bearing, pitch, width, height, style: resolvedStyle, standardConfig: configEntries, publicToken: token },
+          { center, zoom, bearing, pitch, width, height, style: resolvedStyle, standardConfig: configEntries, publicToken: token, retina },
           env!.BROWSER,
         );
         return {
@@ -1348,49 +1517,26 @@ async function executeTool(
       }
 
       // ── Static Images API path (fast, classic styles) ─────────────────────────
+      // Return the URL directly — CDN blocks server-side fetching, client fetches it instead.
       const [lng, lat] = center;
       const sizeStr = retina ? `${width}x${height}@2x` : `${width}x${height}`;
       const camera = pitch !== 0 ? `${lng},${lat},${zoom},${bearing},${pitch}` : `${lng},${lat},${zoom},${bearing}`;
-      const url =
+      const staticUrl =
         `https://api.mapbox.com/styles/v1/${resolvedStyle}/static/` +
         `${camera}/${sizeStr}` +
         `?access_token=${token}`;
 
-      const imgRes = await fetch(url);
-      if (!imgRes.ok) {
-        const errText = await imgRes.text().catch(() => imgRes.statusText);
-        throw new Error(`Mapbox Static Images API error ${imgRes.status}: ${errText}`);
-      }
-      const buf = await imgRes.arrayBuffer();
-      const mimeType = imgRes.headers.get("content-type") ?? "image/jpeg";
-      const bytes = new Uint8Array(buf);
-      let binary = "";
-      const chunkSize = 8192;
-      for (let i = 0; i < bytes.length; i += chunkSize) {
-        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-      }
-      const data = btoa(binary);
-
-      return {
-        _image: { data, mimeType },
-        renderer: "static",
-        width: retina ? width * 2 : width,
-        height: retina ? height * 2 : height,
-        center,
-        zoom,
-        style: resolvedStyle,
-        // No url — image content is returned directly
-      };
+      return { _image_url: staticUrl, renderer: "static" };
     }
 
     case "static_overlay": {
+      const width = 600;
+      const height = 400;
       const {
         center,
         zoom,
-        width = 600,
-        height = 400,
         bearing = 0,
-        retina = false,
+        retina = true,
         style,
         segment,
         standard_config,
@@ -1400,8 +1546,6 @@ async function executeTool(
       } = input as {
         center: [number, number];
         zoom: number;
-        width?: number;
-        height?: number;
         bearing?: number;
         retina?: boolean;
         style?: string;
@@ -1426,37 +1570,31 @@ async function executeTool(
       if (segment && PRESETS[segment]) Object.assign(overlayConfig, PRESETS[segment]);
       if (standard_config && typeof standard_config === "object") Object.assign(overlayConfig, standard_config);
 
-      const resolvedOverlayStyle = style ?? "mapbox/standard";
+      const resolvedOverlayStyle = validateStyle(style ?? "mapbox/standard");
       const hasOverlayConfig = Object.keys(overlayConfig).length > 0;
       const useOverlayWebGL =
         resolvedOverlayStyle === "mapbox/standard" || hasOverlayConfig;
 
       // 1. Render static image (parallel with geometry fetches)
-      const renderPromise = useOverlayWebGL
+      // WebGL path: returns { _image: { data, mimeType } } — bytes are later hosted in KV.
+      // Classic path: returns { _image_url: url } — CDN URL the client fetches directly.
+      //   (CDN blocks server-side fetch; returning the URL avoids an unnecessary round-trip.)
+      type RenderResult = { _image: { data: string; mimeType: string } } | { _image_url: string };
+      const renderPromise: Promise<RenderResult> = useOverlayWebGL
         ? screenshotMap(
-            { center, zoom, bearing, pitch: 0, width, height, style: resolvedOverlayStyle, standardConfig: overlayConfig, publicToken: overlayToken },
+            { center, zoom, bearing, pitch: 0, width, height, style: resolvedOverlayStyle, standardConfig: overlayConfig, publicToken: overlayToken, retina },
             env!.BROWSER,
-          )
-        : (async () => {
+          ).then((imageData) => ({ _image: imageData }))
+        : Promise.resolve((() => {
             const [lng, lat] = center;
             const sizeStr = retina ? `${width}x${height}@2x` : `${width}x${height}`;
             const cameraStr = `${lng},${lat},${zoom},${bearing}`;
-            const imgUrl =
+            const url =
               `https://api.mapbox.com/styles/v1/${resolvedOverlayStyle}/static/` +
               `${cameraStr}/${sizeStr}` +
               `?access_token=${overlayToken}`;
-            const imgRes = await fetch(imgUrl);
-            if (!imgRes.ok) throw new Error(`Mapbox Static Images API error ${imgRes.status}: ${await imgRes.text().catch(() => imgRes.statusText)}`);
-            const buf = await imgRes.arrayBuffer();
-            const mimeType = imgRes.headers.get("content-type") ?? "image/jpeg";
-            const bytes = new Uint8Array(buf);
-            let binary = "";
-            const chunkSize = 8192;
-            for (let i = 0; i < bytes.length; i += chunkSize) {
-              binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-            }
-            return { data: btoa(binary), mimeType };
-          })();
+            return { _image_url: url };
+          })());
 
       // 2. Fetch geometry in parallel
       const routePromises = routes.map((r) =>
@@ -1466,7 +1604,7 @@ async function executeTool(
         fetchIsochronePolygons(iso.location, iso.contours_minutes, iso.profile ?? "driving", mapboxToken)
       );
 
-      const [imageData, ...restResults] = await Promise.all([
+      const [imageResult, ...restResults] = await Promise.all([
         renderPromise,
         ...routePromises,
         ...isoPromises,
@@ -1503,7 +1641,7 @@ async function executeTool(
       );
 
       return {
-        _image: imageData,
+        ...imageResult,   // either { _image: { data, mimeType } } or { _image_url: url }
         renderer: useOverlayWebGL ? "webgl" : "static",
         viewport,
         overlays: {
@@ -1516,16 +1654,6 @@ async function executeTool(
 
     // ── Previously-proxied DevKit tools (now implemented natively) ─────────────
 
-    case "check_color_contrast": {
-      const { foreground, background, level, fontSize } = input as {
-        foreground: string;
-        background: string;
-        level?: "AA" | "AAA";
-        fontSize?: "normal" | "large";
-      };
-      return handleCheckColorContrast({ foreground, background, level, fontSize });
-    }
-
     case "validate_expression": {
       const { expression } = input as { expression: unknown };
       return validateExpression(expression);
@@ -1533,8 +1661,15 @@ async function executeTool(
 
     case "preview_style": {
       const { styleId, title, zoomwheel = true } = input as { styleId: string; title?: string; zoomwheel?: boolean };
+      if (!publicToken) {
+        throw new Error(
+          "preview_style requires a public (pk.*) token to generate a shareable URL. " +
+          "Re-authorise the MCP server and paste your pk.* token in the 'Public key' field on the consent page. " +
+          "A secret (sk.*) token will never be embedded in a preview URL."
+        );
+      }
       const user = encodeURIComponent(getUserNameFromToken(mapboxToken));
-      const params = new URLSearchParams({ access_token: mapboxToken, fresh: "true" });
+      const params = new URLSearchParams({ access_token: publicToken, fresh: "true" });
       if (title) params.set("title", String(title));
       if (!zoomwheel) params.set("zoomwheel", "false");
       const url = `https://api.mapbox.com/styles/v1/${user}/${encodeURIComponent(styleId)}.html?${params}`;
@@ -1574,12 +1709,19 @@ app.post("/mcp", async (c) => {
       // Log clientInfo so we can later detect Figma Make vs Figma Design automatically.
       // To inspect: run `wrangler tail` after connecting from each Figma product.
       const clientInfo = (params as Record<string, unknown> | undefined)?.clientInfo;
+      const clientRequestedVersion = (params as Record<string, unknown> | undefined)?.protocolVersion as string | undefined;
       console.log("[initialize] clientInfo:", JSON.stringify(clientInfo ?? null));
       const initMode = getRequestMode(c);
+      // Echo the client's requested protocol version when it's a known version we support;
+      // otherwise respond with the latest version we implement.
+      const SUPPORTED_VERSIONS = new Set(["2024-11-05", "2025-03-26", "2025-06-18"]);
+      const negotiatedVersion = (clientRequestedVersion && SUPPORTED_VERSIONS.has(clientRequestedVersion))
+        ? clientRequestedVersion
+        : "2025-06-18";
       return c.json({
         jsonrpc: "2.0", id,
         result: {
-          protocolVersion: "2024-11-05",
+          protocolVersion: negotiatedVersion,
           capabilities: { tools: {}, prompts: { listChanged: false } },
           serverInfo: MCP_SERVER_INFO,
           // Spec-sanctioned auto-delivered instructions — surfaces as a system prompt
@@ -1590,7 +1732,9 @@ app.post("/mcp", async (c) => {
     }
 
     if (method === "notifications/initialized") {
-      return c.json({ jsonrpc: "2.0", id, result: {} });
+      // JSON-RPC notifications must not receive a response (no id field in request).
+      // Return 204 to satisfy the HTTP layer without sending a JSON-RPC response object.
+      return new Response(null, { status: 204 });
     }
 
     if (method === "tools/list") {
@@ -1599,38 +1743,41 @@ app.post("/mcp", async (c) => {
     }
 
     if (method === "tools/call") {
+      // Rate-limit per session (or IP when unauthenticated)
+      const rlKey = authHeader?.replace(/^Bearer\s+/i, "").trim() || (c.req.header("CF-Connecting-IP") ?? "unknown");
+      if (!(await checkRateLimit(c.env.SESSIONS, `mcp:${rlKey}`, RATE_LIMIT_TOOL_CALLS))) {
+        return c.json({ jsonrpc: "2.0", id, error: { code: -32000, message: "Rate limit exceeded — max 120 tool calls per minute per session." } }, 429);
+      }
+
       const toolName = (params?.name ?? "") as string;
       const input = (params?.arguments ?? {}) as Record<string, unknown>;
+      // Enforce mode gating on dispatch — same filtering as tools/list.
+      // Design mode may not call interactive-only tools and vice versa.
+      const callMode = getRequestMode(c);
+      if (callMode === "design" && INTERACTIVE_ONLY_TOOLS.has(toolName)) {
+        return c.json({ jsonrpc: "2.0", id, error: { code: -32601, message: `Tool "${toolName}" is not available in Design mode.` } });
+      }
+      if (callMode === "make" && DESIGN_ONLY_TOOLS.has(toolName)) {
+        return c.json({ jsonrpc: "2.0", id, error: { code: -32601, message: `Tool "${toolName}" is not available in Make mode.` } });
+      }
       try {
         const result = await executeTool(toolName, input, mapboxToken, publicToken, c.env);
-        // Image result: return only the image content block (no URL links per design decision)
-        if (result && typeof result === "object" && "_image" in (result as object)) {
-          const { _image } = result as { _image: { data: string; mimeType: string } };
-          return c.json({
-            jsonrpc: "2.0", id,
-            result: {
-              content: [
-                { type: "image", data: _image.data, mimeType: _image.mimeType },
-              ],
-            },
-          });
-        }
-        const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-        return c.json({
-          jsonrpc: "2.0", id,
-          result: { content: [{ type: "text", text }] },
-        });
+        const content = await buildToolContent(result, c.env, base);
+        return c.json({ jsonrpc: "2.0", id, result: { content } });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const raw = err instanceof Error ? err.message : String(err);
         // Signal re-auth if the error is an auth failure
-        if (msg.includes("Authentication required")) {
+        if (raw.includes("Authentication required") || raw.includes("Connect the MCP server")) {
           return c.json(
-            { jsonrpc: "2.0", id, error: { code: -32001, message: msg } },
+            { jsonrpc: "2.0", id, error: { code: -32001, message: raw } },
             401,
             { "WWW-Authenticate": `Bearer realm="${base}", resource_metadata="${base}/.well-known/oauth-protected-resource"` },
           );
         }
-        return c.json({ jsonrpc: "2.0", id, error: { code: -32000, message: msg } });
+        // Sanitize upstream Mapbox API error bodies from the message to avoid leaking internal details.
+        // Preserve our own informative messages; strip raw HTTP response bodies (they often contain JSON blobs).
+        const sanitized = raw.replace(/:\s*\{.*\}$/s, "").replace(/:\s*\[.*\]$/s, "").trim();
+        return c.json({ jsonrpc: "2.0", id, error: { code: -32000, message: sanitized } });
       }
     }
 
@@ -1655,11 +1802,19 @@ app.post("/mcp", async (c) => {
 
   // ── Legacy custom format (Map Studio backend) ─────────────────────────────
   const { tool, input = {} } = body as { tool: string; input?: Record<string, unknown> };
+  // Apply the same mode gating as the JSON-RPC path.
+  const legacyMode = getRequestMode(c);
+  if (legacyMode === "design" && INTERACTIVE_ONLY_TOOLS.has(tool)) {
+    return c.json({ error: `Tool "${tool}" is not available in Design mode.` }, 400);
+  }
+  if (legacyMode === "make" && DESIGN_ONLY_TOOLS.has(tool)) {
+    return c.json({ error: `Tool "${tool}" is not available in Make mode.` }, 400);
+  }
   try {
     return c.json(await executeTool(tool, input, mapboxToken, publicToken, c.env));
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return c.json({ error: msg }, 400);
+    return c.json({ error: msg.replace(/:\s*\{.*\}$/s, "").replace(/:\s*\[.*\]$/s, "").trim() }, 400);
   }
 });
 

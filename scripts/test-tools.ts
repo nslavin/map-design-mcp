@@ -4,12 +4,15 @@
  * Run: npx tsx scripts/test-tools.ts
  */
 
-import { handleCheckColorContrast, handleDesignAudit, handlePaletteSuggest, handleSegmentPreset, handleWcagValidate } from "../src/tools.js";
+import { handleDesignAudit, handlePaletteSuggest, handleSegmentPreset } from "../src/tools.js";
 import { validateExpression, getReference } from "../src/expression-validator.js";
-import { SEGMENT_KEYS } from "../src/design-guidance.js";
-import { DEV_PATTERNS } from "../src/dev-patterns.js";
+import { SEGMENT_KEYS, SEGMENT_GUIDANCE } from "../src/design-guidance.js";
+import { DEV_PATTERNS, EXAMPLE_URLS, GL_JS_VERSION } from "../src/dev-patterns.js";
 import { modeBriefText } from "../src/mode-brief.js";
 import { project, projectCoords } from "../src/projection.js";
+import { buildMapHtml, STYLE_RE, GL_JS_VERSION as RENDERER_GL_JS_VERSION } from "../src/gl-map-renderer.js";
+import { INTERACTIVE_ONLY_TOOLS, DESIGN_ONLY_TOOLS, toolsForMode, buildToolContent } from "../src/index.js";
+import { PRESETS } from "../src/tools.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -165,52 +168,6 @@ test("all segments return a non-empty config", () => {
   }
 });
 
-// ── WCAG Validate ─────────────────────────────────────────────────────────────
-
-console.log("\n── handleWcagValidate ───────────────────────────────────────────");
-
-test("mid-gray label on day background fails AA", () => {
-  const r = handleWcagValidate({
-    standard_config: { lightPreset: "day", colorPlaceLabels: "#888888" },
-  });
-  const pair = r.pairs.find((p) => p.layer_id === "colorPlaceLabels");
-  if (!pair) throw new Error("expected colorPlaceLabels pair");
-  if (pair.passes) throw new Error(`#888888 should fail AA against day background (ratio: ${pair.ratio})`);
-  expect(r.all_pass).toBe(false);
-});
-
-test("dark label on day background passes AA", () => {
-  const r = handleWcagValidate({
-    standard_config: { lightPreset: "day", colorPlaceLabels: "#1a1a1a" },
-    only_failures: false,
-  });
-  const pair = r.pairs.find((p) => p.layer_id === "colorPlaceLabels");
-  if (!pair) throw new Error("expected colorPlaceLabels pair");
-  if (!pair.passes) throw new Error(`#1a1a1a should pass AA against day background (ratio: ${pair.ratio})`);
-});
-
-test("AAA level uses 7.0 threshold", () => {
-  const r = handleWcagValidate({
-    standard_config: { lightPreset: "day", colorPlaceLabels: "#595959" },
-    level: "AAA",
-  });
-  expect(r.pairs.length).toBeGreaterThan(0);
-});
-
-test("style_json mode scans symbol layers", () => {
-  const r = handleWcagValidate({
-    style_json: {
-      layers: [
-        { id: "place-label", type: "symbol", paint: { "text-color": "#111111", "text-halo-color": "#ffffff" } },
-        { id: "line-layer", type: "line", paint: { "line-color": "#ff0000" } },
-      ],
-    },
-    only_failures: false,
-  });
-  expect(r.pairs.length).toBe(1);
-  expect(r.pairs[0]?.layer_id as string).toBe("place-label");
-});
-
 // ── handleDesignAudit — symbol layer validators ───────────────────────────────
 
 console.log("\n── handleDesignAudit (symbol validators) ────────────────────────");
@@ -320,42 +277,6 @@ test("unknown pattern key is not present in DEV_PATTERNS", () => {
   if (content !== undefined) throw new Error("expected undefined for unknown pattern key");
 });
 
-// ── handleCheckColorContrast ──────────────────────────────────────────────────
-
-console.log("\n── handleCheckColorContrast ─────────────────────────────────────");
-
-test("mid-gray on white fails AA normal (ratio ~3.9)", () => {
-  const r = handleCheckColorContrast({ foreground: "#888888", background: "#ffffff" });
-  if (r.passes) throw new Error(`expected fail, got ratio ${r.ratio}`);
-  expect(r.aa_normal).toBe(false);
-});
-
-test("near-black on white passes AA normal (ratio ~16)", () => {
-  const r = handleCheckColorContrast({ foreground: "#111111", background: "#ffffff" });
-  if (!r.passes) throw new Error(`expected pass, got ratio ${r.ratio}`);
-  expect(r.aa_normal).toBe(true);
-});
-
-test("AA large threshold is 3.0", () => {
-  // #777 on white ≈ 4.47:1 — passes AA large (3.0) but not normal (4.5)
-  const r = handleCheckColorContrast({ foreground: "#777777", background: "#ffffff", level: "AA", fontSize: "large" });
-  expect(r.required).toBe(3.0);
-  if (!r.passes) throw new Error(`expected pass at AA large, got ratio ${r.ratio}`);
-});
-
-test("AAA normal threshold is 7.0", () => {
-  const r = handleCheckColorContrast({ foreground: "#888888", background: "#ffffff", level: "AAA" });
-  expect(r.required).toBe(7.0);
-});
-
-test("result includes all four pass/fail flags", () => {
-  const r = handleCheckColorContrast({ foreground: "#555555", background: "#ffffff" });
-  if (typeof r.aa_normal !== "boolean") throw new Error("missing aa_normal");
-  if (typeof r.aa_large !== "boolean") throw new Error("missing aa_large");
-  if (typeof r.aaa_normal !== "boolean") throw new Error("missing aaa_normal");
-  if (typeof r.aaa_large !== "boolean") throw new Error("missing aaa_large");
-});
-
 // ── validateExpression ────────────────────────────────────────────────────────
 
 console.log("\n── validateExpression ───────────────────────────────────────────");
@@ -448,77 +369,67 @@ test("static_map URL is well-formed (synthesized)", () => {
 });
 
 // ── Mode filtering ────────────────────────────────────────────────────────────
-// Tests for toolsForMode() / INTERACTIVE_ONLY_TOOLS without importing index.ts
-// (to avoid Hono side-effects). The set is mirrored here intentionally — any
-// drift from index.ts will surface as a naming mismatch in the tool lists below.
+// Uses the real INTERACTIVE_ONLY_TOOLS / DESIGN_ONLY_TOOLS sets and toolsForMode()
+// imported from index.ts — any drift in the source of truth is caught automatically.
 
 console.log("\n── Mode filtering ───────────────────────────────────────────────");
 
-const INTERACTIVE_ONLY_NAMES = new Set([
-  "get_dev_patterns",
-  "directions",
-  "isochrone",
-  "matrix",
-  "category_search",
-  "validate_expression",
-  "get_reference",
-]);
-
 const STATIC_TOOL_NAMES = [
   "get_design_guidance", "design_audit", "palette_suggest", "segment_preset",
-  "wcag_validate", "static_map", "geocode", "check_color_contrast", "preview_style",
-  "list_styles_tool", "retrieve_style_tool", "create_style_tool", "update_style_tool",
-  "delete_style_tool", "list_tokens_tool", "create_token_tool",
+  "static_map", "geocode", "preview_style",
+  "manage_style", "manage_tokens",
 ];
 
-// Simulate the full MCP_TOOLS list and the filter logic
 const ALL_MOCK_TOOLS = [
-  ...Array.from(INTERACTIVE_ONLY_NAMES),
+  ...Array.from(INTERACTIVE_ONLY_TOOLS),
+  ...Array.from(DESIGN_ONLY_TOOLS),
   ...STATIC_TOOL_NAMES,
 ].map((name) => ({ name, description: "", inputSchema: {} }));
 
-function filterForDesignMode(tools: Array<{ name: string }>) {
-  return tools.filter((t) => !INTERACTIVE_ONLY_NAMES.has(t.name));
-}
-
-test("design mode hides every interactive tool", () => {
-  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+test("design mode hides every interactive-only tool", () => {
+  const result = toolsForMode("design", ALL_MOCK_TOOLS);
   const resultNames = new Set(result.map((t) => t.name));
-  for (const name of INTERACTIVE_ONLY_NAMES) {
+  for (const name of INTERACTIVE_ONLY_TOOLS) {
     if (resultNames.has(name)) throw new Error(`"${name}" should be hidden in design mode`);
   }
 });
 
-test("design mode keeps all static/shared tools", () => {
-  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+test("design mode keeps design-only and shared tools", () => {
+  const result = toolsForMode("design", ALL_MOCK_TOOLS);
   const resultNames = new Set(result.map((t) => t.name));
   for (const name of STATIC_TOOL_NAMES) {
     if (!resultNames.has(name)) throw new Error(`"${name}" should be kept in design mode`);
   }
+  for (const name of DESIGN_ONLY_TOOLS) {
+    if (!resultNames.has(name)) throw new Error(`"${name}" (design-only) should be kept in design mode`);
+  }
 });
 
-test("make mode returns the full tool list (no filtering)", () => {
-  // make = no filter
-  expect(ALL_MOCK_TOOLS.length).toBe(INTERACTIVE_ONLY_NAMES.size + STATIC_TOOL_NAMES.length);
+test("make mode hides design-only tools", () => {
+  const result = toolsForMode("make", ALL_MOCK_TOOLS);
+  const resultNames = new Set(result.map((t) => t.name));
+  for (const name of DESIGN_ONLY_TOOLS) {
+    if (resultNames.has(name)) throw new Error(`"${name}" should be hidden in make mode`);
+  }
 });
 
-test("INTERACTIVE_ONLY set has exactly 7 tools", () => {
-  expect(INTERACTIVE_ONLY_NAMES.size).toBe(7);
+test("INTERACTIVE_ONLY_TOOLS has exactly 7 tools", () => {
+  expect(INTERACTIVE_ONLY_TOOLS.size).toBe(7);
 });
 
 test("design mode result is smaller than make mode result", () => {
-  const designCount = filterForDesignMode(ALL_MOCK_TOOLS).length;
-  const makeCount = ALL_MOCK_TOOLS.length;
+  const designCount = toolsForMode("design", ALL_MOCK_TOOLS).length;
+  const makeCount = toolsForMode("make", ALL_MOCK_TOOLS).length;
   if (designCount >= makeCount) throw new Error(`design (${designCount}) should be < make (${makeCount})`);
 });
 
 test("geocode is kept in design mode (needed to center a static map)", () => {
-  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  const result = toolsForMode("design", ALL_MOCK_TOOLS);
   if (!result.find((t) => t.name === "geocode")) throw new Error("geocode should be kept in design mode");
 });
 
 test("static_map is kept in design mode", () => {
-  const result = filterForDesignMode(ALL_MOCK_TOOLS);
+  const result = toolsForMode("design", ALL_MOCK_TOOLS);
   if (!result.find((t) => t.name === "static_map")) throw new Error("static_map should be kept in design mode");
 });
 
@@ -530,8 +441,8 @@ test("design brief contains static-only language", () => {
   const text = modeBriefText("design");
   if (!text.includes("Figma Design")) throw new Error("expected 'Figma Design'");
   if (!text.includes("static only")) throw new Error("expected 'static only'");
-  if (!text.includes("DO NOT")) throw new Error("expected 'DO NOT' section");
-  if (!text.includes("get_dev_patterns")) throw new Error("expected 'get_dev_patterns' in DO NOT list");
+  if (!text.includes("Do not")) throw new Error("expected 'Do not' section");
+  if (!text.includes("get_dev_patterns")) throw new Error("expected 'get_dev_patterns' in Do not list");
 });
 
 test("make brief contains interactive language", () => {
@@ -550,8 +461,8 @@ test("mode_brief prompt uses same text as modeBriefText (no duplication drift)",
   // each brief starts with the expected header.
   const design = modeBriefText("design");
   const make = modeBriefText("make");
-  if (!design.startsWith("MAP DESIGN MODE: Figma Design")) throw new Error("design brief header mismatch");
-  if (!make.startsWith("MAP DESIGN MODE: Figma Make")) throw new Error("make brief header mismatch");
+  if (!design.startsWith("MAP DESIGN MODE — Figma Design")) throw new Error("design brief header mismatch");
+  if (!make.startsWith("MAP DESIGN MODE — Figma Make")) throw new Error("make brief header mismatch");
 });
 
 // ── Projection (src/projection.ts) ───────────────────────────────────────────
@@ -609,6 +520,342 @@ test("design brief mentions static_overlay", () => {
 test("make brief does NOT mention static_overlay", () => {
   const text = modeBriefText("make");
   if (text.includes("static_overlay")) throw new Error("make brief should not mention static_overlay");
+});
+
+// ── Security / validation hardening ──────────────────────────────────────────
+
+console.log("\n── Security / validation hardening ─────────────────────────────");
+
+test("palette_suggest throws on non-hex brand_color", () => {
+  let threw = false;
+  try { handlePaletteSuggest({ brand_color: "blue", segment: "real_estate", background: "light" }); }
+  catch { threw = true; }
+  if (!threw) throw new Error("expected throw for non-hex brand_color 'blue'");
+});
+
+// P1.3: design_audit malformed input → violations, not a throw
+test("design_audit handles non-array layers gracefully (no throw)", () => {
+  const r = handleDesignAudit({ style_json: { layers: "bad" as unknown as [], sources: {} } });
+  if (!Array.isArray(r.violations)) throw new Error("expected violations array even on malformed input");
+});
+
+test("design_audit handles layer missing id (no throw)", () => {
+  const r = handleDesignAudit({
+    style_json: {
+      layers: [{ type: "symbol", source: "my-src" } as { id: string; type: string; source: string }],
+      sources: { "my-src": { type: "geojson" } },
+    },
+  });
+  if (!Array.isArray(r.violations)) throw new Error("expected violations array for layer without id");
+});
+
+// ── STYLE_RE / buildMapHtml validation ────────────────────────────────────────
+
+console.log("\n── STYLE_RE / buildMapHtml ──────────────────────────────────────");
+
+test("STYLE_RE accepts valid owner/styleId", () => {
+  if (!STYLE_RE.test("mapbox/standard")) throw new Error("mapbox/standard should be valid");
+  if (!STYLE_RE.test("myuser/my-style-v2")) throw new Error("myuser/my-style-v2 should be valid");
+});
+
+test("STYLE_RE accepts full mapbox:// URI form", () => {
+  if (!STYLE_RE.test("mapbox://styles/mapbox/streets-v12")) throw new Error("full URI form should be valid");
+});
+
+test("STYLE_RE rejects </script> injection attempt", () => {
+  if (STYLE_RE.test("mapbox/x</script><script>alert(1)</script>")) {
+    throw new Error("</script> injection should be rejected");
+  }
+});
+
+test("STYLE_RE rejects path traversal attempt", () => {
+  if (STYLE_RE.test("../../../etc/passwd")) throw new Error("path traversal should be rejected");
+});
+
+test("buildMapHtml throws on invalid style", () => {
+  let threw = false;
+  try {
+    buildMapHtml({
+      style: "bad</script>injection",
+      center: [-122, 37], zoom: 12, bearing: 0, pitch: 0,
+      width: 600, height: 400, standardConfig: {}, publicToken: "pk.test",
+    });
+  } catch { threw = true; }
+  if (!threw) throw new Error("expected throw for invalid style");
+});
+
+test("buildMapHtml throws on non-finite numeric param", () => {
+  let threw = false;
+  try {
+    buildMapHtml({
+      style: "mapbox/standard",
+      center: [NaN, 37], zoom: 12, bearing: 0, pitch: 0,
+      width: 600, height: 400, standardConfig: {}, publicToken: "pk.test",
+    });
+  } catch { threw = true; }
+  if (!threw) throw new Error("expected throw for NaN center longitude");
+});
+
+test("buildMapHtml returns HTML for valid params", () => {
+  const html = buildMapHtml({
+    style: "mapbox/standard",
+    center: [-122, 37], zoom: 12, bearing: 0, pitch: 0,
+    width: 600, height: 400, standardConfig: {}, publicToken: "pk.test",
+  });
+  if (!html.includes("mapboxgl.accessToken")) throw new Error("HTML should contain token setup");
+  if (!html.includes("mapbox://styles/mapbox/standard")) throw new Error("HTML should contain style URL");
+});
+
+// ── buildToolContent ─────────────────────────────────────────────────────────
+
+console.log("\n── buildToolContent ─────────────────────────────────────────────");
+
+test("_image_url only → one text block equal to the URL", async () => {
+  const url = "https://api.mapbox.com/styles/v1/mapbox/streets-v12/static/0,0,1/600x400?access_token=pk.test";
+  const content = await buildToolContent({ _image_url: url }, null, "https://example.com");
+  if (content.length !== 1) throw new Error(`expected 1 block, got ${content.length}`);
+  if (content[0].type !== "text") throw new Error(`expected type 'text', got '${content[0].type}'`);
+  if ((content[0] as { type: "text"; text: string }).text !== url) throw new Error(`URL mismatch: ${(content[0] as { type: "text"; text: string }).text}`);
+});
+
+test("_image_url + viewport/overlays → two text blocks; second parses to {viewport, overlays}", async () => {
+  const url = "https://example.com/img.jpg";
+  const viewport = { center: [-122, 37], zoom: 12, width: 600, height: 400, bearing: 0 };
+  const overlays = { markers: [{ lng: -122, lat: 37, x: 300, y: 200, in_view: true }], routes: [], isochrones: [] };
+  const content = await buildToolContent({ _image_url: url, viewport, overlays }, null, "https://example.com");
+  if (content.length !== 2) throw new Error(`expected 2 blocks, got ${content.length}`);
+  if (content[0].type !== "text") throw new Error("first block should be text");
+  if ((content[0] as { type: "text"; text: string }).text !== url) throw new Error("first block should be the URL");
+  if (content[1].type !== "text") throw new Error("second block should be text");
+  const parsed = JSON.parse((content[1] as { type: "text"; text: string }).text) as { viewport: unknown; overlays: unknown };
+  if (!parsed.viewport) throw new Error("second block should have viewport");
+  if (!parsed.overlays) throw new Error("second block should have overlays");
+});
+
+test("_image (no env) → image block + URL", async () => {
+  const b64 = "aGVsbG8=";
+  const content = await buildToolContent({ _image: { data: b64, mimeType: "image/png" } }, null, "https://example.com");
+  if (content.length !== 2) throw new Error(`expected 2 blocks, got ${content.length}`);
+  const imgBlock = content[0] as { type: string; data: string; mimeType: string };
+  if (imgBlock.type !== "image") throw new Error(`block 0 should be type 'image', got: ${imgBlock.type}`);
+  if (imgBlock.data !== b64) throw new Error("base64 payload mismatch");
+  const urlText = (content[1] as { type: "text"; text: string }).text;
+  if (!urlText.includes("/img/")) throw new Error(`block 1 should contain /img/, got: ${urlText.slice(0, 60)}`);
+});
+
+test("_image + overlay (no env) → image block + URL + viewport/overlays", async () => {
+  const viewport = { center: [-122, 37], zoom: 12, width: 600, height: 400, bearing: 0 };
+  const overlays = { markers: [{ lng: -122, lat: 37, x: 300, y: 200, in_view: true }], routes: [], isochrones: [] };
+  const b64 = "aGVsbG8=";
+  const content = await buildToolContent(
+    { _image: { data: b64, mimeType: "image/png" }, viewport, overlays },
+    null, "https://example.com",
+  );
+  if (content.length !== 3) throw new Error(`expected 3 blocks, got ${content.length}`);
+  const imgBlock = content[0] as { type: string; data: string; mimeType: string };
+  if (imgBlock.type !== "image") throw new Error(`block 0 should be type 'image', got: ${imgBlock.type}`);
+  if (imgBlock.data !== b64) throw new Error("base64 payload mismatch");
+  if (!(content[1] as { type: "text"; text: string }).text.includes("/img/")) throw new Error("block 1 should be URL");
+  const parsed = JSON.parse((content[2] as { type: "text"; text: string }).text) as { viewport: unknown; overlays: unknown };
+  if (!parsed.viewport) throw new Error("missing viewport");
+  if (!parsed.overlays) throw new Error("missing overlays");
+});
+
+test("plain object → single JSON text block", async () => {
+  const result = { score: 95, violations: [] };
+  const content = await buildToolContent(result, null, "https://example.com");
+  if (content.length !== 1) throw new Error(`expected 1 block, got ${content.length}`);
+  if (content[0].type !== "text") throw new Error("expected text block");
+  const parsed = JSON.parse((content[0] as { type: "text"; text: string }).text) as typeof result;
+  if (parsed.score !== 95) throw new Error("score should be 95");
+});
+
+test("string result → single text block with the string verbatim", async () => {
+  const content = await buildToolContent("hello world", null, "https://example.com");
+  if (content.length !== 1) throw new Error(`expected 1 block, got ${content.length}`);
+  if ((content[0] as { type: "text"; text: string }).text !== "hello world") throw new Error("text mismatch");
+});
+
+// ── isAllowedRedirectUri ──────────────────────────────────────────────────────
+// isAllowedRedirectUri is not exported, so we re-implement the logic inline
+// to keep tests self-contained (the function is pure URL classification).
+
+console.log("\n── isAllowedRedirectUri ─────────────────────────────────────────");
+
+function isAllowedRedirectUri(uri: string): boolean {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === "https:") return true;
+    if (u.protocol === "claude:" || u.protocol === "vscode:") return true;
+    if (u.protocol === "http:" && (u.hostname === "localhost" || u.hostname === "127.0.0.1")) return true;
+    return false;
+  } catch { return false; }
+}
+
+test("https:// any host is allowed", () => {
+  if (!isAllowedRedirectUri("https://example.com/callback")) throw new Error("expected allowed");
+});
+test("http://localhost with port is allowed", () => {
+  if (!isAllowedRedirectUri("http://localhost:8080/callback")) throw new Error("expected allowed");
+});
+test("http://127.0.0.1 is allowed", () => {
+  if (!isAllowedRedirectUri("http://127.0.0.1:3000/cb")) throw new Error("expected allowed");
+});
+test("claude:// deep link is allowed", () => {
+  if (!isAllowedRedirectUri("claude://auth/callback")) throw new Error("expected allowed");
+});
+test("vscode:// deep link is allowed", () => {
+  if (!isAllowedRedirectUri("vscode://auth/callback")) throw new Error("expected allowed");
+});
+test("http:// to non-loopback host is blocked", () => {
+  if (isAllowedRedirectUri("http://evil.com/steal")) throw new Error("expected blocked");
+});
+test("plain string (no protocol) is blocked", () => {
+  if (isAllowedRedirectUri("evil.com/steal")) throw new Error("expected blocked");
+});
+test("empty string is blocked", () => {
+  if (isAllowedRedirectUri("")) throw new Error("expected blocked");
+});
+
+// ── PKCE S256 derivation ──────────────────────────────────────────────────────
+
+console.log("\n── PKCE S256 derivation ─────────────────────────────────────────");
+
+async function pkceS256(verifier: string): Promise<string> {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+test("known verifier produces known challenge", async () => {
+  // RFC 7636 test vector: verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+  const verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+  const challenge = await pkceS256(verifier);
+  const expected = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+  if (challenge !== expected) throw new Error(`expected ${expected}, got ${challenge}`);
+});
+
+test("different verifiers produce different challenges", async () => {
+  const c1 = await pkceS256("verifierOne");
+  const c2 = await pkceS256("verifierTwo");
+  if (c1 === c2) throw new Error("expected different challenges");
+});
+
+test("challenge is base64url (no +, /, or =)", async () => {
+  const challenge = await pkceS256("some-random-verifier-string-of-decent-length");
+  if (/[+/=]/.test(challenge)) throw new Error(`challenge contains invalid chars: ${challenge}`);
+});
+
+// ── Segment / PRESET parity ───────────────────────────────────────────────────
+
+console.log("\n── Segment / PRESET parity ──────────────────────────────────────");
+
+test("every PRESET segment has a SEGMENT_GUIDANCE block", () => {
+  const presetKeys = Object.keys(PRESETS);
+  const guidanceKeys = new Set(Object.keys(SEGMENT_GUIDANCE));
+  const missing = presetKeys.filter((k) => !guidanceKeys.has(k));
+  if (missing.length > 0) throw new Error(`PRESETS have no SEGMENT_GUIDANCE: ${missing.join(", ")}`);
+});
+
+test("every SEGMENT_GUIDANCE block has a PRESET", () => {
+  const guidanceKeys = Object.keys(SEGMENT_GUIDANCE);
+  const presetKeySet = new Set(Object.keys(PRESETS));
+  const missing = guidanceKeys.filter((k) => !presetKeySet.has(k));
+  if (missing.length > 0) throw new Error(`SEGMENT_GUIDANCE has no PRESET: ${missing.join(", ")}`);
+});
+
+test("SEGMENT_KEYS matches SEGMENT_GUIDANCE keys exactly", () => {
+  const guidanceKeys = Object.keys(SEGMENT_GUIDANCE).sort();
+  const segKeys = [...SEGMENT_KEYS].sort();
+  if (JSON.stringify(guidanceKeys) !== JSON.stringify(segKeys))
+    throw new Error(`mismatch: SEGMENT_KEYS=${segKeys.join(",")} GUIDANCE=${guidanceKeys.join(",")}`);
+});
+
+// ── GL JS version consistency ──────────────────────────────────────────────────
+
+console.log("\n── GL JS version consistency ─────────────────────────────────────");
+
+test("dev-patterns GL_JS_VERSION matches renderer GL_JS_VERSION", () => {
+  if (GL_JS_VERSION !== RENDERER_GL_JS_VERSION)
+    throw new Error(`version mismatch: dev-patterns=${GL_JS_VERSION} renderer=${RENDERER_GL_JS_VERSION}`);
+});
+
+test("scaffolding pattern CDN URL contains the declared GL_JS_VERSION", () => {
+  const content = DEV_PATTERNS["scaffolding"] ?? "";
+  if (!content.includes(`v${GL_JS_VERSION}`))
+    throw new Error(`scaffolding CDN URL does not contain v${GL_JS_VERSION}`);
+});
+
+// ── Expression validator enrichment ───────────────────────────────────────────
+
+console.log("\n── Expression validator enrichment ──────────────────────────────");
+
+test("within operator is valid (was previously false-unknown)", () => {
+  const r = validateExpression(["within", { type: "Feature", geometry: { type: "Polygon", coordinates: [] } }]);
+  if (!r.valid) throw new Error(`expected valid, got errors: ${r.errors.map((e) => e.message).join(", ")}`);
+});
+
+test("hsl color constructor is valid", () => {
+  const r = validateExpression(["hsl", 200, 80, 50]);
+  if (!r.valid) throw new Error(`expected valid, got errors: ${r.errors.map((e) => e.message).join(", ")}`);
+});
+
+test("case with even args warns about missing fallback", () => {
+  const r = validateExpression(["case", ["has", "name"], "yes", "maybe"]);
+  if (r.warnings.some((w) => w.message.includes("case"))) {
+    // has odd args (3) — should NOT warn
+    throw new Error("should not warn for odd-arg case");
+  }
+});
+
+test("case with even args (missing fallback) produces a warning", () => {
+  // ["case", cond1, out1, cond2, out2] = 4 args = even = likely missing fallback
+  const r = validateExpression(["case", ["has", "name"], "yes", ["has", "foo"], "no"]);
+  const hasWarn = r.warnings.some((w) => w.message.includes("case"));
+  if (!hasWarn) throw new Error("expected case warning for even args");
+});
+
+test("interpolate with odd stop/value count produces error", () => {
+  // ["interpolate", ["linear"], ["zoom"], 10, 1, 15] — stop 15 has no value
+  const r = validateExpression(["interpolate", ["linear"], ["zoom"], 10, 1, 15]);
+  const hasError = r.errors.some((e) => e.message.includes("interpolate"));
+  if (!hasError) throw new Error("expected error for odd stop/value count");
+});
+
+test("boolean literal returnType is 'boolean', not 'number'", () => {
+  const r = validateExpression(true);
+  if (r.metadata.returnType !== "boolean") throw new Error(`expected boolean, got ${r.metadata.returnType}`);
+});
+
+test("null literal returnType is 'null'", () => {
+  const r = validateExpression(null);
+  if (r.metadata.returnType !== "null") throw new Error(`expected null, got ${r.metadata.returnType}`);
+});
+
+test("getReference for 'lightPreset' returns Standard config entry", () => {
+  const r = getReference("lightPreset");
+  if (!r.found || !r.entry) throw new Error("expected found entry for lightPreset");
+  if (!r.entry.summary.includes("Standard")) throw new Error("expected Standard config mention");
+});
+
+test("getReference for 'slot' returns slot entry", () => {
+  const r = getReference("slot");
+  if (!r.found || !r.entry) throw new Error("expected found entry for slot");
+});
+
+test("getReference with 1-char query returns not-found", () => {
+  const r = getReference("e");
+  if (r.found) throw new Error("expected not-found for single-char query");
+});
+
+test("retina param plumbs through to buildMapHtml (MapRenderParams)", () => {
+  // buildMapHtml accepts retina (optional boolean) — verify it builds without error with retina:true
+  const html = buildMapHtml({
+    center: [0, 0], zoom: 10, bearing: 0, pitch: 0,
+    width: 600, height: 400, style: "mapbox/standard",
+    standardConfig: {}, publicToken: "pk.test", retina: true,
+  });
+  if (!html.includes("mapbox-gl.js")) throw new Error("expected mapbox-gl.js in HTML");
 });
 
 // ── Summary ───────────────────────────────────────────────────────────────────

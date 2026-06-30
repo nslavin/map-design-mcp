@@ -10,7 +10,21 @@ export interface GuidanceBlock {
   };
 }
 
-// ── Segment guidance (13 entries) ────────────────────────────────────────────
+// ── Shared guidance constants (single-sourced to avoid drift) ─────────────────
+
+export const MARKER_COUNT_RULE =
+  "Marker count drives rendering choice: <50 HTML Marker (DOM interaction), 50-1k GL symbol layer (collision+feature-state), 1k-100k clustered GL layer, >100k vector tileset.";
+
+export const NO_HTML_MARKERS_ABOVE_100 =
+  "Don't use HTML markers above 50-100 concurrent markers — DOM thrashing kills scroll and zoom performance; use GL symbol or circle layers instead.";
+
+export const NIGHT_LIGHTING_RULE =
+  "lightPreset:'night' only changes lighting and atmosphere — it does not recolor roads or land. Always design an explicit night config rather than deriving it from the day config.";
+
+export const COLORBREWER_RULE =
+  "Sequential ColorBrewer ramp for one-direction data; Diverging (RdBu or PuOr) for bidirectional/political data. Never use rainbow/spectral for ordered data — rainbow has no perceptual ordering.";
+
+// ── Segment guidance (17 entries) ────────────────────────────────────────────
 
 export const SEGMENT_GUIDANCE: Record<string, GuidanceBlock> = {
   logistics_customer: {
@@ -228,7 +242,7 @@ export const SEGMENT_GUIDANCE: Record<string, GuidanceBlock> = {
   outdoors: {
     principles: [
       "Terrain and contours dominant — use Outdoors or Winter theme",
-      "Paths/cycleways get visual prominence over car roads — may require Classic mode",
+      "Paths/cycleways get visual prominence over car roads — add a custom line layer on top of Standard (no Classic needed)",
       "GPS traces: line-width expression scaling with zoom, never >4px at z14",
       "Filter commercial POIs entirely — show only campsites, trailheads, water sources",
     ],
@@ -236,7 +250,7 @@ export const SEGMENT_GUIDANCE: Record<string, GuidanceBlock> = {
       "Use theme:'outdoors' or theme:'winter' as base",
       "Show terrain relief — consider Standard outdoors or a hillshade raster layer",
       "GPS trace line: line-width: ['interpolate',['linear'],['zoom'], 10, 1, 16, 4]",
-      "For trail prominence: switch to Classic to control cycleway layer order explicitly",
+      "For trail prominence: add a custom line layer (slot:'middle') on Standard — yellow highlight at z13+, car roads in grey",
       "Remove or minimize commercial POI layers",
     ],
     dont_list: [
@@ -372,7 +386,7 @@ export const SEGMENT_GUIDANCE: Record<string, GuidanceBlock> = {
       "Trust > aesthetics — every design decision evaluated against legibility under stress",
     ],
     do_list: [
-      "Use Light or Standard faded theme — restrained colors only",
+      "Use Standard faded theme — restrained colors only (Classic light-v11 only as last resort if Standard config is insufficient)",
       "WCAG AA (4.5:1) minimum for all text/icon pairs",
       "Hazard layers: slot:'top', fill-emissive-strength:1, high contrast against basemap",
       "Build Static Images API fallback for spike traffic scenarios",
@@ -394,9 +408,124 @@ export const SEGMENT_GUIDANCE: Record<string, GuidanceBlock> = {
     },
     color_targets: { text_contrast_min: 4.5 },
   },
+
+  travel_discovery: {
+    principles: [
+      "Discovery is the product — every landmark, POI, and 3D building is a signal, not noise",
+      "Full basemap density encourages exploration; a faded map discourages it",
+      "3D and landmark icons serve as spatial anchors for orientation",
+      "Rely on Mapbox Standard's curated POI hierarchy rather than custom layers",
+    ],
+    do_list: [
+      "Enable showLandmarkIcons:true, showPointOfInterestLabels:true, show3dBuildings:true",
+      "Use lightPreset:'day' for maximum label legibility and vibrant color",
+      "Apply brand color only to saved-place markers and selected-POI callouts",
+      "Offer a list↔map toggle — some users prefer scanning text at discovery stage",
+      "Use zoom-dependent clustering for user-generated pins above 50 points",
+    ],
+    dont_list: [
+      "Don't faded or monochrome the base — it communicates 'nothing to see here'",
+      "Don't suppress road labels — street names are how people mentally map an area",
+      "Don't apply brand color to the basemap — it obscures the content hierarchy",
+      "Don't open the map zoomed out below z12 — discovery needs street-level context",
+    ],
+    config_hints: {
+      lightPreset: "day",
+      theme: "default",
+      showPointOfInterestLabels: true,
+      showLandmarkIcons: true,
+      show3dBuildings: true,
+    },
+  },
+
+  travel_navigation: {
+    principles: [
+      "Wayfinding mode: route line is the primary visual element, everything else supports it",
+      "Landmark icons act as turn-cue anchors — keep them on, reduce general POI noise",
+      "Legibility at a glance — text must be large enough to read while moving",
+      "Consistent color language: brand on route, neutral on basemap",
+    ],
+    do_list: [
+      "Set route layer slot:'top' so it always renders above buildings and POIs",
+      "Keep showLandmarkIcons:true — landmarks are the strongest turn-cue anchors",
+      "Reduce showPointOfInterestLabels — full POI density competes with the route",
+      "Use lightPreset:'dusk' or 'night' for nighttime driving — test both explicitly",
+      "Show lane geometry at minzoom:17 for complex junctions",
+    ],
+    dont_list: [
+      "Don't hide road labels — upcoming street names are critical navigation context",
+      "Don't use a faded basemap — drivers need clear spatial context at speed",
+      "Don't use pitch > 45° unless explicitly building a turn-by-turn 3D view",
+      "Don't derive night config from day config algorithmically — build an explicit night preset",
+    ],
+    config_hints: {
+      lightPreset: "day",
+      theme: "default",
+      showLandmarkIcons: true,
+      showPointOfInterestLabels: false,
+      show3dBuildings: false,
+    },
+  },
+
+  telecom: {
+    principles: [
+      "Coverage gradient is the product — brand color encodes signal strength, not identity",
+      "Light/faded basemap is required — a dark base washes out the gradient readability",
+      "Never use a custom brand-color ramp just because the brand has a color",
+      "Update cadence matters: weekly tileset recipe beats a one-off upload",
+    ],
+    do_list: [
+      "Use faded or monochrome theme — neutral canvas maximizes gradient legibility",
+      "Encode coverage: brand color at strong signal, near-white (#f0f0f0) at weak — not zero opacity",
+      "Expression: ['interpolate',['linear'],['get','signal'], 0,'#f0f0f0', 100, brandColor]",
+      "Upload coverage polygons via Mapbox Tiling Service for weekly recipe support",
+      "Show administrative boundaries (state/county) at z5–z9 as reference layers",
+    ],
+    dont_list: [
+      "Don't use a dark basemap — light/faded base is required for gradient legibility",
+      "Don't use raw opacity to encode signal (opacity 0 = invisible = ambiguous coverage vs no data)",
+      "Don't hardcode coverage URLs — use tileset IDs with Tiling Service update recipes",
+      "Don't apply brand color to roads or water — reserve it entirely for the coverage layer",
+    ],
+    config_hints: {
+      theme: "faded",
+      lightPreset: "day",
+      showPointOfInterestLabels: false,
+      showLandmarkIcons: false,
+      show3dBuildings: false,
+    },
+  },
+
+  mobility: {
+    principles: [
+      "Vehicle icons are the primary layer — basemap context is support, not the story",
+      "Service zones and restricted zones need visual distinction at a glance",
+      "Performance degrades fast above 100 HTML markers — use GL layers",
+      "Real-time state changes (idle/active/low-battery) drive icon selection via feature-state",
+    ],
+    do_list: [
+      "Use feature-state to set icon-image per vehicle state (idle/active/low-battery)",
+      "Service zones: brand fill at 15% opacity + solid brand line border",
+      "Restricted zones: red fill at 20% opacity + dashed red border (line-dasharray:[2,2])",
+      "Above 100 vehicles: use circle or symbol layers, not HTML Markers",
+      "Above 500 vehicles on ops dashboard: enable cluster:true on the source",
+    ],
+    dont_list: [
+      "Don't use HTML markers for fleets — DOM thrashing above 50 kills scroll performance",
+      "Don't use the same color for service zones and brand identity elsewhere",
+      "Don't use dark themes for customer-facing views — reserve for driver/ops surfaces",
+      "Don't show 3D buildings for the customer map — vehicle dots need flat context",
+    ],
+    config_hints: {
+      theme: "default",
+      lightPreset: "day",
+      showPointOfInterestLabels: false,
+      show3dBuildings: false,
+    },
+  },
 };
 
-// ── Topic guidance (8 entries) ────────────────────────────────────────────────
+// ── Topic guidance (10 entries) ────────────────────────────────────────────────
 
 export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
   color: {
@@ -501,8 +630,8 @@ export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
     do_list: [
       "< 100 markers: HTML Marker or Symbol layer — either fine",
       "100–1,000 markers: Symbol or Circle layer (GL-rendered, not DOM)",
-      "1,000–10,000 markers: Clustered Symbol/Circle layer",
-      "> 10,000 markers: Vector tileset — GeoJSON will freeze the map",
+      "1,000–100,000 markers: Clustered Symbol/Circle layer (cluster:true)",
+      "> 100,000 markers: Vector tileset — GeoJSON will freeze the browser at this scale",
       "Source reuse: share one source for fill + line + label layers on same data",
       "Style order: set map style before adding sources/layers (style.load event)",
     ],
@@ -555,12 +684,14 @@ export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
         "cyberpunk": { hue: -15, saturation: 1.4, brightness: 0.9, contrast: 1.3 },
       },
     },
-    color_targets: { land_lightness_min: 0 },
+    // dark_mode does not enforce a land_lightness_min — the constraint is an
+    // *upper* bound (land must be dark enough). That check lives in design_audit's
+    // lightness-contrast rule. No color_targets needed here.
   },
 
   data_viz: {
     principles: [
-      "Choose the layer type by data volume: < 100 marker; 100-1k symbol/circle; 1k-50k clustered; >50k tileset",
+      "Choose the layer type by data volume: < 100 marker; 100-1k symbol/circle; 1k-100k clustered; >100k tileset",
       "Choropleth: normalize all values (per capita, rate, %) — never raw counts to polygon color",
       "Sequential ramp for one-direction data; diverging for pos/neg; qualitative for categories",
       "Never use rainbow/spectral for ordered data — yellow reads as peak, green as 'good'",
@@ -619,9 +750,10 @@ export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
 
   icons: {
     principles: [
-      "THREE options — Marker (mapboxgl.Marker + CSS backgroundImage): small sets <50, per-element interaction, use SVG/PNG file directly; Symbol layer (icon-image): 50+ points, collision detection, clustering, feature state; Dots (circle layer + text): dense data, no icon needed",
+      "Marker (mapboxgl.Marker + CSS backgroundImage): small sets <50 points, per-element interaction, use SVG/PNG directly — no rasterization needed",
+      "Symbol layer (icon-image): 50+ points — provides collision detection, clustering, and feature-state; SVG must use flat fills only",
+      "Dots (circle layer + text-field): dense data where a custom icon is not needed",
       "All custom layers go in slot:'top' — lower slots bury markers under roads and basemap labels",
-      "SVG for symbol layers must have flat fills only — gradients/filters break canvas rasterization; for Figma Make SVGs strip <defs>/<linearGradient>/<filter>/<clipPath> and replace gradient refs with flat hex",
       "icon-size must be a zoom-interpolate expression — a flat number looks wrong across zoom levels",
     ],
     do_list: [
@@ -679,6 +811,43 @@ export const TOPIC_GUIDANCE: Record<string, GuidanceBlock> = {
       },
     },
   },
+  basemaps: {
+    principles: [
+      "Default to 'mapbox/standard' — it supports 3D buildings, landmarks, lightPreset, and all Standard config",
+      "'mapbox/standard-satellite' adds satellite imagery under the Standard 3D layer stack",
+      "Classic styles (streets-v12, light-v11, dark-v11, outdoors-v12, satellite-v9, satellite-streets-v12) render 2D via the Static Images API — fast but no 3D or config",
+      "For data overlays and choropleths: light-v11 (light bg) or dark-v11 (dark bg) mute the basemap so data reads clearly",
+      "For imagery context without label clutter: satellite-v9 (no labels) or satellite-streets-v12 (labels on top)",
+      "For outdoor / terrain maps: outdoors-v12 has contour lines, terrain shading, and trail networks",
+    ],
+    do_list: [
+      "Use standard for branded consumer apps that need 3D, night mode, or themed colors",
+      "Use standard-satellite when aerial context + 3D landmark labels are both needed",
+      "Use light-v11 / dark-v11 as the backdrop for choropleth, heatmap, or data-viz layers",
+      "Use satellite-v9 when imagery alone is the message (no label noise)",
+      "Use satellite-streets-v12 for real-estate or logistics where imagery context + address labels are both needed",
+      "Use outdoors-v12 for hiking, trail, or recreation maps",
+      "Pass a custom 'username/styleId' to use a studio-authored style",
+    ],
+    dont_list: [
+      "Don't use streets-v12 for data-overlay maps — too much visual noise competes with the data layer",
+      "Don't use satellite-v9 when users need to navigate by street name or address",
+      "Don't use Standard config properties (lightPreset, show3dBuildings, etc.) on Classic styles — they have no effect",
+      "Don't default to Classic styles just for speed unless the use-case truly doesn't need 3D or config",
+    ],
+    config_hints: {
+      styles: {
+        "mapbox/standard": "WebGL — 3D buildings + landmarks, lightPreset (day/dusk/dawn/night), themes, full Standard config. Default.",
+        "mapbox/standard-satellite": "WebGL — satellite imagery base + 3D + place/road labels.",
+        "mapbox/streets-v12": "Classic (Static Images API) — detailed 2D street map, full labels/POIs.",
+        "mapbox/light-v11": "Classic — minimal light/neutral backdrop; ideal for data overlays & choropleths.",
+        "mapbox/dark-v11": "Classic — minimal dark backdrop; data viz, dark-mode UIs.",
+        "mapbox/outdoors-v12": "Classic — terrain shading, contour lines, trails; hiking/outdoor.",
+        "mapbox/satellite-v9": "Classic — pure satellite imagery, NO labels.",
+        "mapbox/satellite-streets-v12": "Classic — satellite imagery + street & place labels.",
+      },
+    },
+  },
 };
 
 // ── Lookup helpers ────────────────────────────────────────────────────────────
@@ -721,8 +890,8 @@ export function getGuidance(segment?: string, topic?: string): {
 
   if (hasTopic) {
     const hints: string[] = [];
-    if (topic === "color") hints.push("palette_suggest", "wcag_validate");
-    else if (topic === "dark_mode") hints.push("wcag_validate");
+    if (topic === "color") hints.push("palette_suggest", "design_audit");
+    else if (topic === "dark_mode") hints.push("design_audit");
     else if (topic === "data_viz" || topic === "performance") hints.push("get_dev_patterns");
     hints.push("design_audit");
     return {
@@ -737,11 +906,11 @@ export function getGuidance(segment?: string, topic?: string): {
     principles: [
       "Build palettes in OKLCH/LCh — not HSL. colorWater S≥70% always for night-safety.",
       "Visual hierarchy (top→bottom): user content → POI/labels → roads → buildings → land.",
-      "Marker count drives rendering: <100 HTML/Symbol, 100-1k GL circle, 1k-10k clustered, >10k tileset.",
+      MARKER_COUNT_RULE,
       "Route line: always slot:'top', emissive-strength:1 on all non-3D custom layers.",
       "Zoom continuity: fade layers in/out over 1–2 zoom levels — no hard cutoffs.",
       "Standard config covers 95% of design needs — only switch to Classic for per-layer paint expressions.",
-      "Night mode: design explicitly — lightPreset:'night' only changes lighting, not color hierarchy.",
+      NIGHT_LIGHTING_RULE,
     ],
     do_list: [
       "Call get_design_guidance(segment=) for use-case rules before choosing colors or config",
@@ -754,13 +923,13 @@ export function getGuidance(segment?: string, topic?: string): {
     dont_list: [
       "Don't make land darker than roads",
       "Don't leave default blue water on branded consumer products",
-      "Don't use HTML markers above 100 concurrent markers",
-      "Don't use rainbow/spectral for ordered data",
+      NO_HTML_MARKERS_ABOVE_100,
+      COLORBREWER_RULE,
       "Don't set lightPreset:'night' as the complete dark solution",
     ],
     config_hints: {
-      "use_segment_for": "logistics, travel, real_estate, automotive, data_viz, outdoors, social, journalism, retail, weather, public_sector",
-      "use_topic_for": "color, hierarchy, typography, performance, dark_mode, data_viz, zoom_strategy, standard_config",
+      "use_segment_for": "logistics_customer, logistics_driver, logistics_ops, travel, travel_discovery, travel_navigation, real_estate, automotive, data_viz, outdoors, social, journalism, retail, weather, telecom, mobility, public_sector",
+      "use_topic_for": "color, hierarchy, typography, performance, dark_mode, data_viz, zoom_strategy, icons, standard_config, basemaps",
     },
   };
 

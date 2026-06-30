@@ -1,7 +1,15 @@
+// ── Version constants ─────────────────────────────────────────────────────────
+// GL_JS_VERSION single source of truth lives in gl-map-renderer.ts.
+// Import + re-export so both the template strings and external consumers share it.
+import { GL_JS_VERSION } from "./gl-map-renderer.js";
+export { GL_JS_VERSION };
+export const DIRECTIONS_PLUGIN_VERSION = "4.3.1";
+export const GEOCODER_PLUGIN_VERSION = "5.1.0";
+
 export const DEV_PATTERNS: Record<string, string> = {
 
 scaffolding: `
-MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable)
+MAPBOX GL JS SCAFFOLDING (v${GL_JS_VERSION})
 
 ━━ STEP 0 — TOKEN (do this before writing a single line of map code) ━━━━━━━━
   See TOKEN SECURITY section for full instructions.
@@ -15,8 +23,8 @@ MAPBOX GL JS SCAFFOLDING (v3.21.0 — current stable)
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <!-- CSS MUST come before the script tag — controls are invisible without it -->
-  <link href="https://api.mapbox.com/mapbox-gl-js/v3.21.0/mapbox-gl.css" rel="stylesheet">
-  <script src="https://api.mapbox.com/mapbox-gl-js/v3.21.0/mapbox-gl.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v${GL_JS_VERSION}/mapbox-gl.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/v${GL_JS_VERSION}/mapbox-gl.js"></script>
   <style>
     /* REQUIRED: body and #map must have explicit height — zero-height = invisible map */
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -273,8 +281,8 @@ ROUTING AND DIRECTIONS:
 Examples: /example/mapbox-gl-directions/ /example/animate-point-along-route/
 
 mapbox-gl-directions plugin (full UI with inputs + turn-by-turn):
-  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.3.1/mapbox-gl-directions.js"></script>
-  <link href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v4.3.1/mapbox-gl-directions.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v${DIRECTIONS_PLUGIN_VERSION}/mapbox-gl-directions.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-directions/v${DIRECTIONS_PLUGIN_VERSION}/mapbox-gl-directions.css" rel="stylesheet">
   map.addControl(new MapboxDirections({
     accessToken:mapboxgl.accessToken, unit:'metric',
     profile:'mapbox/cycling'  // 'mapbox/driving'|'mapbox/walking'|'mapbox/cycling'
@@ -323,8 +331,8 @@ Interactive autocomplete → @mapbox/search-js-react (NOT raw Geocoding API):
   Why: auto session tokens, built-in debounce, correct two-step suggestions/retrieve flow
 
 mapbox-gl-geocoder plugin (adds search control to map):
-  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v5.1.0/mapbox-gl-geocoder.min.js"></script>
-  <link href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v5.1.0/mapbox-gl-geocoder.css" rel="stylesheet">
+  <script src="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v${GEOCODER_PLUGIN_VERSION}/mapbox-gl-geocoder.min.js"></script>
+  <link href="https://api.mapbox.com/mapbox-gl-js/plugins/mapbox-gl-geocoder/v${GEOCODER_PLUGIN_VERSION}/mapbox-gl-geocoder.css" rel="stylesheet">
   map.addControl(new MapboxGeocoder({
     accessToken:mapboxgl.accessToken, mapboxgl:mapboxgl, marker:false,
     bbox:[sw_lng,sw_lat,ne_lng,ne_lat], countries:'fi', language:'fi',
@@ -410,11 +418,16 @@ Update paint at runtime:
 Update layout at runtime:
   map.setLayoutProperty('labels','text-size',14)
 
-Style switch — re-add custom layers after:
+Standard style config change (preferred — no reload):
+  map.setConfigProperty('basemap','lightPreset','night')  // switch to dark
+  map.setConfigProperty('basemap','lightPreset','day')    // back to light
+  map.setConfigProperty('basemap','theme','faded')        // desaturate basemap
+  // ALWAYS use setConfigProperty() for Standard — never setStyle() for incremental changes
+
+Classic-only style swap (last resort — re-add custom layers after, ~1s reload):
   map.on('style.load',()=>addCustomLayers())
   map.setStyle('mapbox://styles/mapbox/dark-v11')
-  // NEVER use setStyle() for incremental changes — only full style swap
-  // For incremental: setConfigProperty() / setPaintProperty() / setLayoutProperty()
+  // Only use setStyle() for full basemap replacement to a Classic style
 `,
 
 clustering: `
@@ -514,7 +527,11 @@ Weather (Standard v3):
   map.setRain({density:0.5,opacity:0.7,intensity:0.8})
   map.setSnow({density:0.4,opacity:1.0,intensity:0.5,vignette:0.3})
 
-3D buildings (classic styles — Standard already includes them):
+3D buildings on Standard (default — already built in, just configure):
+  map.setConfigProperty('basemap','show3dBuildings',true)   // on (default)
+  map.setConfigProperty('basemap','show3dBuildings',false)  // off
+
+3D buildings on Classic styles only (NOT needed on Standard — use above instead):
   const labelId=map.getStyle().layers.find(l=>l.type==='symbol'&&l.layout['text-field']).id
   map.addLayer({id:'3d-buildings',source:'composite','source-layer':'building',
     filter:['==','extrude','true'],type:'fill-extrusion',minzoom:15,

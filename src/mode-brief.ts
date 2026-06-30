@@ -1,48 +1,32 @@
 /** Client mode for mode-gating and instructions. */
 export type ClientMode = "design" | "make";
 
-/**
- * Returns the per-mode system instructions delivered via initialize.instructions
- * and the mode_brief MCP prompt. Single source of truth for both channels.
- */
 export function modeBriefText(mode: ClientMode): string {
   if (mode === "design") {
-    return `MAP DESIGN MODE: Figma Design (static only)
+    return `MAP DESIGN MODE — Figma Design (static only)
 
-You are assisting a static design workflow — NOT building an interactive map.
+Tools to use:
+  • static_map — returns TWO text blocks: (1) a PNG URL you can curl, (2) a data URI fallback.
+      Preferred: curl "<url>" -o /tmp/map.png
+      Fallback if curl is blocked: echo "$DATA_URI" | sed 's/data:[^;]*;base64,//' | base64 -d > /tmp/map.png
+      Then: upload_assets → POST bytes → place as image fill on the target node.
+  • static_overlay — same two image blocks as static_map PLUS a third text block:
+        { viewport, overlays: { markers, routes, isochrones } }
+      Each overlay entry has {x, y, in_view} pixel coords. Place the image fill first,
+      then draw vector pins/paths at those pixel positions on top.
+  • segment_preset, preview_style — style previews
+  • geocode — resolve addresses to coordinates
+  • get_design_guidance, design_audit, palette_suggest
+  • manage_style — list/retrieve/create/update/delete Mapbox styles
+  • manage_tokens — list/create Mapbox public access tokens
 
-DELIVER:
-  • Static map images via static_map (returns image bytes to embed as a design fill)
-  • Geo-positioned overlays via static_overlay — returns the static image PLUS each pin/route/isochrone
-    projected to pixel {x,y} coordinates (and a viewport transform) so Figma can place them as real,
-    editable vector layers at the correct position on top of the map. Geometry is fetched server-side
-    (no interactive code). Routes and isochrones come from the Mapbox Directions/Isochrone APIs.
-  • Segment-tuned map previews via segment_preset (includes preview_url)
-  • Style previews via preview_style
-  • Use geocode to resolve addresses to coordinates for centering a static map
-  • Design recommendations: get_design_guidance, design_audit, palette_suggest, wcag_validate, check_color_contrast
-  • Style management: list/retrieve/create/update/delete style, list/create tokens
-
-DO NOT:
-  • Implement a Mapbox GL JS interactive map (no HTML/JS map code)
-  • Call get_dev_patterns — it produces browser-side interactive map code
-  • Call directions / isochrone / matrix — these feed live interactive routing layers
-    (use static_overlay instead, which fetches the same data and projects it to pixels)
-  • Call category_search — this drives interactive POI layers
-  • Call validate_expression or get_reference — these are GL JS dev helpers
-
-When the user asks for a map: return a static image URL and design recommendations.
-When they describe an interaction (click, pan, zoom in code): explain that interactive maps
-are built in Figma Make, and offer the equivalent static image + design guidance instead.`;
+Do not write Mapbox GL JS code. Do not call get_dev_patterns, directions, isochrone, matrix, category_search, validate_expression, or get_reference.`;
   }
 
-  return `MAP DESIGN MODE: Figma Make (interactive prototyping)
+  return `MAP DESIGN MODE — Figma Make (interactive)
 
-You are helping build an interactive Mapbox GL JS map prototype. Full tool set available.
+Start every new map with get_dev_patterns(pattern='scaffolding') — it has the token setup and common root causes of invisible maps.
 
-ALWAYS start with get_dev_patterns(pattern='scaffolding') on any new map —
-it contains the mandatory token setup and top-5 root causes of invisible maps.
-
-Use get_design_guidance / design_audit / palette_suggest for cartographic quality.
-Use static_map / segment_preset for quick image previews during design iteration.`;
+Use get_design_guidance, design_audit, palette_suggest for cartographic quality.
+Use static_map / segment_preset for quick image previews.`;
 }

@@ -3,9 +3,21 @@ main = "src/index.ts"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# KV namespace for OAuth sessions (nonces, codes, session tokens)
+# KV namespace for OAuth sessions (nonces, codes, session tokens, rate-limit counters).
 # Create with: wrangler kv namespace create SESSIONS
 # Then paste the returned id below.
+# NOTE: wrangler.dev.toml uses a separate KV namespace (different id + Worker name)
+#       so dev and prod never share session state.
 [[kv_namespaces]]
 binding = "SESSIONS"
 id = "0507d0bffd7c40f5b330c304916f0b61"
+
+# Cloudflare Browser Rendering — headless Chrome for WebGL map screenshots.
+# Requires Workers Paid plan. Enables mapbox/standard + full GL JS rendering.
+[browser]
+binding = "BROWSER"
+
+# Secret: ENCRYPTION_KEY — 32-byte hex string (64 hex chars) used for AES-256-GCM
+# encryption of stored Mapbox sk.* tokens in KV.
+# Set with: wrangler secret put ENCRYPTION_KEY
+# Generate: openssl rand -hex 32

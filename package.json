@@ -1,6 +1,6 @@
 {
   "name": "map-design-mcp-worker",
-  "version": "1.0.0",
+  "version": "2.1.0",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
@@ -9,6 +9,7 @@
     "test": "tsx scripts/test-tools.ts"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "^1.1.0",
     "hono": "^4.6.0"
   },
   "devDependencies": {
